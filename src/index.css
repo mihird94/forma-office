@@ -1,0 +1,660 @@
+@import "tailwindcss";
+@import "katex/dist/katex.min.css";
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  }
+}
+
+/* Custom crisp scrollbars for grid & panels */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: #f1f5f9;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 5px;
+  border: 2px solid #f1f5f9;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}
+
+/* TipTap / ProseMirror Document Editor Styles */
+.forma-doc-editor {
+  outline: none;
+  min-height: 820px;
+  font-size: 15px;
+  line-height: 1.7;
+  color: #1e293b;
+}
+
+.forma-doc-editor p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  float: left;
+  color: #94a3b8;
+  pointer-events: none;
+  height: 0;
+}
+
+.forma-doc-editor h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1.25;
+  margin-top: 1.5rem;
+  margin-bottom: 0.75rem;
+  color: #0f172a;
+  letter-spacing: -0.02em;
+}
+
+.forma-doc-editor h2 {
+  font-size: 1.45rem;
+  font-weight: 600;
+  line-height: 1.3;
+  margin-top: 1.4rem;
+  margin-bottom: 0.5rem;
+  color: #0f172a;
+  padding-bottom: 0.25rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.forma-doc-editor h3 {
+  font-size: 1.15rem;
+  font-weight: 600;
+  line-height: 1.4;
+  margin-top: 1.15rem;
+  margin-bottom: 0.4rem;
+  color: #1e293b;
+}
+
+.forma-doc-editor p {
+  margin-bottom: 0.75rem;
+}
+
+.forma-doc-editor ul {
+  list-style-type: disc;
+  padding-left: 1.5rem;
+  margin-bottom: 0.85rem;
+}
+
+.forma-doc-editor ol {
+  list-style-type: decimal;
+  padding-left: 1.5rem;
+  margin-bottom: 0.85rem;
+}
+
+.forma-doc-editor li {
+  margin-bottom: 0.25rem;
+}
+
+.forma-doc-editor ul[data-type="taskList"] {
+  list-style: none;
+  padding-left: 0.25rem;
+}
+
+.forma-doc-editor ul[data-type="taskList"] li {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.5rem;
+}
+
+.forma-doc-editor ul[data-type="taskList"] li > label {
+  margin-top: 0.2rem;
+  user-select: none;
+}
+
+.forma-doc-editor ul[data-type="taskList"] li > div {
+  flex: 1;
+}
+
+.forma-doc-editor blockquote {
+  border-left: 3.5px solid #2563eb;
+  background: #f8fafc;
+  padding: 0.65rem 1rem;
+  margin: 1rem 0;
+  color: #334155;
+  font-style: italic;
+  border-radius: 0 6px 6px 0;
+}
+
+.forma-doc-editor pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.85rem;
+  padding: 0.9rem 1.1rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.forma-doc-editor code {
+  background: #f1f5f9;
+  color: #be123c;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.86em;
+  padding: 0.12rem 0.35rem;
+  border-radius: 4px;
+}
+
+.forma-doc-editor pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.forma-doc-editor a {
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.forma-doc-editor hr {
+  border: none;
+  border-top: 2px solid #e2e8f0;
+  margin: 1.5rem 0;
+}
+
+.forma-doc-editor img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+  margin: 0.75rem 0;
+}
+
+.forma-doc-editor table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 1rem 0;
+  table-layout: fixed;
+  overflow: hidden;
+}
+
+.forma-doc-editor th,
+.forma-doc-editor td {
+  border: 1px solid #cbd5e1;
+  padding: 0.5rem 0.7rem;
+  vertical-align: top;
+  position: relative;
+  min-width: 60px;
+}
+
+.forma-doc-editor th {
+  background: #f1f5f9;
+  font-weight: 600;
+  color: #0f172a;
+  text-align: left;
+}
+
+.forma-doc-editor .selectedCell::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(37, 99, 235, 0.12);
+  pointer-events: none;
+}
+
+/* Page Break visual indicator */
+.forma-doc-editor :is(br, hr).page-break {
+  display: block;
+  border-top: 2px dashed #94a3b8;
+  position: relative;
+  margin: 2rem 0;
+}
+
+/* Reading Modes for Forma Docs (Paperwhite, Sepia, Night) */
+.forma-theme-paperwhite .forma-doc-editor {
+  color: #1f1e1b;
+}
+.forma-theme-paperwhite .forma-doc-editor h1,
+.forma-theme-paperwhite .forma-doc-editor h2,
+.forma-theme-paperwhite .forma-doc-editor h3 {
+  color: #141310;
+  border-color: #dcd9ce;
+}
+.forma-theme-paperwhite .forma-doc-editor th {
+  background: #eceae0;
+  color: #1c1b18;
+}
+.forma-theme-paperwhite .forma-doc-editor th,
+.forma-theme-paperwhite .forma-doc-editor td {
+  border-color: #d3d0c4;
+}
+
+.forma-theme-sepia .forma-doc-editor {
+  color: #3d2f1e;
+}
+.forma-theme-sepia .forma-doc-editor h1,
+.forma-theme-sepia .forma-doc-editor h2,
+.forma-theme-sepia .forma-doc-editor h3 {
+  color: #2b1f12;
+  border-color: #dccba8;
+}
+.forma-theme-sepia .forma-doc-editor blockquote {
+  background: #ede1c5;
+  border-left-color: #9a6b2f;
+  color: #4b3a24;
+}
+.forma-theme-sepia .forma-doc-editor th {
+  background: #eae0c7;
+  color: #2b1f12;
+}
+.forma-theme-sepia .forma-doc-editor th,
+.forma-theme-sepia .forma-doc-editor td {
+  border-color: #d4c39f;
+}
+.forma-theme-sepia .forma-doc-editor code {
+  background: #e9dec2;
+  color: #7c2d12;
+}
+
+.forma-theme-dark .forma-doc-editor {
+  color: #e2e8f0;
+}
+.forma-theme-dark .forma-doc-editor h1,
+.forma-theme-dark .forma-doc-editor h2,
+.forma-theme-dark .forma-doc-editor h3 {
+  color: #f8fafc;
+  border-color: #334155;
+}
+.forma-theme-dark .forma-doc-editor blockquote {
+  background: #242a35;
+  border-left-color: #60a5fa;
+  color: #cbd5e1;
+}
+.forma-theme-dark .forma-doc-editor th {
+  background: #242a35;
+  color: #f1f5f9;
+}
+.forma-theme-dark .forma-doc-editor th,
+.forma-theme-dark .forma-doc-editor td {
+  border-color: #334155;
+}
+.forma-theme-dark .forma-doc-editor code {
+  background: #27303f;
+  color: #fda4af;
+}
+.forma-theme-dark .forma-doc-editor a {
+  color: #60a5fa;
+}
+
+/* Forma Lab Markdown & DataFrame Output Prose */
+.forma-nb-prose h1 {
+  font-size: 1.65rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin-bottom: 0.65rem;
+  line-height: 1.25;
+}
+.forma-nb-prose h2 {
+  font-size: 1.28rem;
+  font-weight: 650;
+  margin-top: 1.1rem;
+  margin-bottom: 0.45rem;
+  padding-bottom: 0.2rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.35);
+}
+.forma-nb-prose h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin-top: 0.85rem;
+  margin-bottom: 0.35rem;
+}
+.forma-nb-prose p {
+  margin-bottom: 0.6rem;
+  line-height: 1.68;
+}
+.forma-nb-prose ul {
+  list-style: disc;
+  padding-left: 1.4rem;
+  margin-bottom: 0.65rem;
+}
+.forma-nb-prose ol {
+  list-style: decimal;
+  padding-left: 1.4rem;
+  margin-bottom: 0.65rem;
+}
+.forma-nb-prose code {
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.86em;
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  background: rgba(124, 58, 237, 0.09);
+  color: #6d28d9;
+}
+.forma-nb-prose pre {
+  background: #0f172a;
+  color: #e2e8f0;
+  padding: 0.8rem 1rem;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+  font-size: 0.82rem;
+}
+.forma-nb-prose pre code {
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+.forma-nb-prose blockquote {
+  border-left: 3px solid #7c3aed;
+  padding: 0.4rem 0.9rem;
+  margin: 0.75rem 0;
+  background: rgba(124, 58, 237, 0.06);
+  border-radius: 0 6px 6px 0;
+}
+.forma-nb-prose table,
+.forma-nb-html-out table {
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  margin: 0.5rem 0;
+}
+.forma-nb-prose th,
+.forma-nb-prose td,
+.forma-nb-html-out th,
+.forma-nb-html-out td {
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  padding: 0.35rem 0.6rem;
+  text-align: left;
+}
+.forma-nb-prose th,
+.forma-nb-html-out th {
+  background: rgba(148, 163, 184, 0.15);
+  font-weight: 600;
+}
+.forma-theme-dark .forma-nb-prose code {
+  background: rgba(167, 139, 250, 0.16);
+  color: #c4b5fd;
+}
+
+/* Forma Lab Python 3 Syntax Highlighting (Light / Warm Paperwhite-Sepia / Night) */
+.forma-py-layer {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  line-height: 21px;
+  tab-size: 4;
+  letter-spacing: 0;
+  word-spacing: 0;
+  font-variant-ligatures: none;
+}
+.forma-py-textarea::selection {
+  background: rgba(124, 58, 237, 0.22);
+}
+.forma-py-dark .forma-py-textarea::selection {
+  background: rgba(167, 139, 250, 0.28);
+}
+
+/* Light theme (GitHub / VS Code Light+ inspired) */
+.forma-py-light {
+  color: #1e293b;
+}
+.forma-py-light .py-tok-keyword {
+  color: #7c3aed;
+  font-weight: 600;
+}
+.forma-py-light .py-tok-constant {
+  color: #be123c;
+  font-weight: 600;
+}
+.forma-py-light .py-tok-builtin {
+  color: #0284c7;
+}
+.forma-py-light .py-tok-defname {
+  color: #2563eb;
+  font-weight: 600;
+}
+.forma-py-light .py-tok-string {
+  color: #059669;
+}
+.forma-py-light .py-tok-number {
+  color: #c2410c;
+}
+.forma-py-light .py-tok-comment {
+  color: #64748b;
+  font-style: italic;
+}
+.forma-py-light .py-tok-decorator {
+  color: #b45309;
+  font-weight: 500;
+}
+.forma-py-light .py-tok-operator {
+  color: #475569;
+}
+
+/* Warm Paperwhite / Sepia bookish palette */
+.forma-py-warm {
+  color: #33271a;
+}
+.forma-py-warm .py-tok-keyword {
+  color: #6d28d9;
+  font-weight: 600;
+}
+.forma-py-warm .py-tok-constant {
+  color: #9f1239;
+  font-weight: 600;
+}
+.forma-py-warm .py-tok-builtin {
+  color: #0369a1;
+}
+.forma-py-warm .py-tok-defname {
+  color: #1d4ed8;
+  font-weight: 600;
+}
+.forma-py-warm .py-tok-string {
+  color: #15803d;
+}
+.forma-py-warm .py-tok-number {
+  color: #b45309;
+}
+.forma-py-warm .py-tok-comment {
+  color: #8c7a5b;
+  font-style: italic;
+}
+.forma-py-warm .py-tok-decorator {
+  color: #a16207;
+  font-weight: 500;
+}
+.forma-py-warm .py-tok-operator {
+  color: #6b5a42;
+}
+
+/* Night / Dark theme (Tokyo Night / One Dark inspired — also used in Markdown fenced code blocks) */
+.forma-py-dark,
+.forma-nb-prose pre {
+  color: #e2e8f0;
+}
+.forma-py-dark .py-tok-keyword,
+.forma-nb-prose pre .py-tok-keyword {
+  color: #c084fc;
+  font-weight: 600;
+}
+.forma-py-dark .py-tok-constant,
+.forma-nb-prose pre .py-tok-constant {
+  color: #fb7185;
+  font-weight: 600;
+}
+.forma-py-dark .py-tok-builtin,
+.forma-nb-prose pre .py-tok-builtin {
+  color: #38bdf8;
+}
+.forma-py-dark .py-tok-defname,
+.forma-nb-prose pre .py-tok-defname {
+  color: #60a5fa;
+  font-weight: 600;
+}
+.forma-py-dark .py-tok-string,
+.forma-nb-prose pre .py-tok-string {
+  color: #34d399;
+}
+.forma-py-dark .py-tok-number,
+.forma-nb-prose pre .py-tok-number {
+  color: #fb923c;
+}
+.forma-py-dark .py-tok-comment,
+.forma-nb-prose pre .py-tok-comment {
+  color: #64748b;
+  font-style: italic;
+}
+.forma-py-dark .py-tok-decorator,
+.forma-nb-prose pre .py-tok-decorator {
+  color: #fbbf24;
+  font-weight: 500;
+}
+.forma-py-dark .py-tok-operator,
+.forma-nb-prose pre .py-tok-operator {
+  color: #94a3b8;
+}
+
+/* Print Styles for clean Save-as-PDF (always crisp black-on-white regardless of reading theme) */
+@media print {
+  body {
+    background: white !important;
+  }
+  .no-print {
+    display: none !important;
+  }
+  .print-paper {
+    box-shadow: none !important;
+    border: none !important;
+    background: white !important;
+    margin: 0 !important;
+    padding: 0.5in !important;
+    width: 100% !important;
+    max-width: none !important;
+  }
+  .print-paper canvas {
+    filter: none !important;
+  }
+  .forma-doc-editor :is(br, hr).page-break {
+    page-break-after: always;
+    break-after: page;
+    border: none;
+    margin: 0;
+  }
+}
+
+.forma-find-match { background: #fef08a; color: #0f172a; }
+.forma-find-active { background: #fb923c; color: #0f172a; outline: 1px solid #c2410c; }
+
+/* Obsidian-style Live In-Place LaTeX / KaTeX Rendering in Forma Docs */
+.forma-doc-editor .forma-latex-source-hidden {
+  display: inline-block;
+  width: 0;
+  height: 0;
+  font-size: 0;
+  line-height: 0;
+  letter-spacing: 0;
+  color: transparent;
+  overflow: hidden;
+  vertical-align: baseline;
+}
+
+.forma-doc-editor .forma-latex-block-hidden {
+  height: 0;
+  margin: 0 !important;
+  padding: 0 !important;
+  font-size: 0;
+  line-height: 0;
+  overflow: hidden;
+}
+
+.forma-doc-editor .forma-latex-source-editing {
+  background: rgba(59, 130, 246, 0.1);
+  color: #1d4ed8;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.9em;
+  border-radius: 4px;
+  padding: 0.08rem 0.25rem;
+}
+
+.forma-doc-editor .forma-latex-widget {
+  cursor: pointer;
+  border-radius: 5px;
+  transition: background-color 120ms ease;
+}
+
+.forma-doc-editor .forma-latex-widget:hover {
+  background: rgba(59, 130, 246, 0.08);
+}
+
+.forma-doc-editor .forma-latex-inline {
+  display: inline-block;
+  padding: 0 2px;
+  vertical-align: baseline;
+}
+
+.forma-doc-editor .forma-latex-display {
+  display: block;
+  text-align: center;
+  margin: 0.75rem 0;
+  padding: 0.45rem 0.75rem;
+  overflow-x: auto;
+}
+
+.forma-doc-editor .forma-latex-live-preview {
+  user-select: none;
+  pointer-events: none;
+}
+
+.forma-doc-editor .forma-latex-live-preview-inline {
+  display: inline-flex;
+  align-items: center;
+  margin-left: 0.45rem;
+  padding: 0.1rem 0.45rem;
+  border-radius: 6px;
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  vertical-align: middle;
+}
+
+.forma-doc-editor .forma-latex-live-preview-display {
+  display: block;
+  text-align: center;
+  margin: 0.45rem 0 0.85rem;
+  padding: 0.55rem 0.85rem;
+  border-radius: 8px;
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+  overflow-x: auto;
+}
+
+.forma-theme-sepia .forma-doc-editor .katex {
+  color: #3d2f1e;
+}
+
+.forma-theme-dark .forma-doc-editor .katex {
+  color: #e2e8f0;
+}
+
+.forma-theme-dark .forma-doc-editor .forma-latex-source-editing {
+  background: rgba(96, 165, 250, 0.16);
+  color: #93c5fd;
+}
+
+.forma-theme-dark .forma-doc-editor .forma-latex-widget:hover {
+  background: rgba(96, 165, 250, 0.12);
+}
+
+.forma-theme-dark .forma-doc-editor .forma-latex-live-preview-inline,
+.forma-theme-dark .forma-doc-editor .forma-latex-live-preview-display {
+  background: #1e293b;
+  border-color: #334155;
+}
+
+@media print {
+  .forma-doc-editor .forma-latex-source-hidden {
+    display: none !important;
+  }
+  .forma-doc-editor .forma-latex-live-preview {
+    display: none !important;
+  }
+}

@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+macos/build/
+*.tsbuildinfo
+
+# OS & editor junk
+.DS_Store
+.AppleDouble
+.LSOverride
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Logs & env
+*.log
+npm-debug.log*
+.env
+.env.*
