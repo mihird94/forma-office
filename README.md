@@ -104,7 +104,7 @@ npm run dev
 
 ```bash
 npx tsc -b                          # Strict TypeScript check
-npm test -- --run                   # Vitest unit & format round-trip suite (15 suites / 73 tests)
+npm test -- --run                   # Vitest unit & format round-trip suite (15 suites / 74 tests)
 node scripts/verify-indexer.mjs     # E2E indexer, OCR/vision retrieval, and 10-tool MCP verification
 node scripts/verify-index-watcher.mjs # E2E FSEvents watcher & LaunchAgent resilience tests
 ```
