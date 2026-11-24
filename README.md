@@ -4,6 +4,69 @@ An open-format, local-first office, scientific notebook, whiteboard, and multimo
 
 Forma keeps your documents strictly on your Mac in standard open formats (`.xlsx`, `.docx`, `.pptx`, `.pdf`, `.ipynb`, `.md`, `.fcanvas`/`.excalidraw`) and pairs them with a self-contained **EmbeddingGemma 2 (Text + Vision)** search engine, global **`⌃Space`** Spotlight launcher, and a **10-tool MCP server** so AI coding assistants can search, read, and create real files directly inside your watched folders.
 
+<table align="center">
+  <tr>
+    <td align="center" width="96"><img src="docs/assets/icons/sheets.png" width="52" alt="Forma Sheets" /><br/><sub><b>Sheets</b></sub></td>
+    <td align="center" width="96"><img src="docs/assets/icons/docs.png" width="52" alt="Forma Docs" /><br/><sub><b>Docs</b></sub></td>
+    <td align="center" width="96"><img src="docs/assets/icons/slides.png" width="52" alt="Forma Slides" /><br/><sub><b>Slides</b></sub></td>
+    <td align="center" width="96"><img src="docs/assets/icons/pdf.png" width="52" alt="Forma PDF" /><br/><sub><b>PDF</b></sub></td>
+    <td align="center" width="96"><img src="docs/assets/icons/lab.png" width="52" alt="Forma Lab" /><br/><sub><b>Lab</b></sub></td>
+    <td align="center" width="96"><img src="docs/assets/icons/canvas.png" width="52" alt="Forma Canvas" /><br/><sub><b>Canvas</b></sub></td>
+    <td align="center" width="96"><img src="docs/assets/icons/search.png" width="52" alt="Forma Search" /><br/><sub><b>Search</b></sub></td>
+  </tr>
+</table>
+
+---
+
+## Interface Preview
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/forma-sheets.png"><img src="docs/assets/screenshots/forma-sheets.png" alt="Forma Sheets — SaaS Operating Model with DAG formulas and embedded chart" /></a>
+      <br/><b>Forma Sheets</b> — Incremental DAG formula engine, cross-sheet refs, and live <code>.xlsx</code>-roundtripped charts.
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/forma-docs.png"><img src="docs/assets/screenshots/forma-docs.png" alt="Forma Docs — Technical Spec with live outline and paginated layout" /></a>
+      <br/><b>Forma Docs</b> — TipTap/ProseMirror rich editor with live KaTeX/LaTeX, outline navigation, and <code>.docx</code>/<code>.md</code> export.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/forma-canvas.png"><img src="docs/assets/screenshots/forma-canvas.png" alt="Forma Canvas — Infinite SVG whiteboard with bound connectors" /></a>
+      <br/><b>Forma Canvas</b> — Infinite SVG whiteboard with smart bound connectors, Mermaid import, and Excalidraw v2 compatibility.
+    </td>
+    <td width="50%" valign="top">
+      <a href="docs/assets/screenshots/forma-lab.png"><img src="docs/assets/screenshots/forma-lab.png" alt="Forma Lab — Scaled Dot-Product Attention notebook with KaTeX math and reactive slider" /></a>
+      <br/><b>Forma Lab</b> — Local Python 3 kernel with inline KaTeX math, reactive <code># @slider</code> controls, and AST cell DAG tracking.
+    </td>
+  </tr>
+</table>
+
+---
+
+## Architecture
+
+```mermaid
+flowchart LR
+  Apps["7 Native arm64 Apps (Swift / WKWebView)"]
+  Search["Forma Search Launcher (⌃Space)"]
+  Files["Watched Open Formats (.xlsx, .docx, .pptx, .pdf, .ipynb, .fcanvas)"]
+  Indexer["forma-indexer Daemon (FSEvents + Daily 02:00 Reconcile)"]
+  Store["Hybrid Local Index (SQLite FTS5 + Accelerate vDSP + Vision OCR)"]
+  Embed["On-Demand llama-server (EmbeddingGemma 2, 0600 Unix Socket)"]
+  MCP["10-Tool Stdio MCP Server (Claude Code, Cursor, Gemini CLI)"]
+
+  Apps -->|"Read & write open files"| Files
+  Files -->|"FSEvents delta"| Indexer
+  Indexer -->|"768-dim text & image vectors"| Embed
+  Indexer -->|"FTS5 tokens + vectors + OCR"| Store
+  Search -->|"Hybrid lexical + vector rank"| Store
+  Search -.->|"Query embedding"| Embed
+  MCP -->|"Search, read & create files"| Files
+  MCP -->|"Semantic retrieval"| Store
+```
+
 ---
 
 ## Applications
@@ -117,3 +180,4 @@ node scripts/verify-index-watcher.mjs # E2E FSEvents watcher & LaunchAgent resil
 - `macos/` — Native arm64 Cocoa/`WKWebView` app host (`FormaHost.swift`), Carbon/AppKit Spotlight launcher (`FormaSpotlight.swift`), FSEvents background indexer (`FormaIndexerCLI.swift`, `FormaIndexWatch.swift`), multimodal index & Unix-socket bridge (`FormaSemanticIndex.swift`, `FormaSocketHTTP.c`), Python kernel (`forma_kernel.py`), and app icon generator (`GenerateIcons.swift`)
 - `mcp/forma-mcp/` — 10-tool stdio MCP server and declarative `.fcanvas`/`.xlsx`/`.pptx`/`.docx` creators
 - `scripts/` — macOS app builder/installer (`build-macos-apps.sh`), model stager (`setup-embedded-models.sh`), LaunchAgent installers, and E2E verification harnesses
+- `docs/assets/` — Native macOS app icons and interface screenshots referenced in this README
