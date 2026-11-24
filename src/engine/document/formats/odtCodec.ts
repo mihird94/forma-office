@@ -1,4 +1,4 @@
-import JSZip from 'jszip';
+import { FastZip } from '../../../utils/fastZip';
 import { FormaDocument } from '../../../types/document';
 import { uid } from '../../spreadsheet/workbookOps';
 
@@ -170,8 +170,8 @@ function serializeBlockToOdt(el: Element, images: OdtImageAsset[]): string {
  * Export a Forma Document to ISO/IEC 26300 OpenDocument Text (.odt).
  */
 export async function exportDocumentToOdt(doc: FormaDocument): Promise<Uint8Array> {
-  const zip = new JSZip();
-  zip.file('mimetype', ODT_MIME, { compression: 'STORE' });
+  const zip = new FastZip();
+  zip.writeText('mimetype', ODT_MIME, { store: true });
 
   const manifestXml = `<?xml version="1.0" encoding="UTF-8"?>
 <manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
@@ -265,14 +265,14 @@ export async function exportDocumentToOdt(doc: FormaDocument): Promise<Uint8Arra
   </office:body>
 </office:document-content>`;
 
-  zip.file('META-INF/manifest.xml', finalManifest);
-  zip.file('styles.xml', stylesXml);
-  zip.file('content.xml', contentXml);
+  zip.writeText('META-INF/manifest.xml', finalManifest);
+  zip.writeText('styles.xml', stylesXml);
+  zip.writeText('content.xml', contentXml);
   for (const img of images) {
-    zip.file(img.path, img.bytes);
+    zip.writeBytes(img.path, img.bytes);
   }
 
-  return zip.generateAsync({ type: 'uint8array' });
+  return zip.toUint8Array();
 }
 
 function escapeHtml(str: string): string {
@@ -368,12 +368,12 @@ export async function importDocumentFromOdt(
   bytes: ArrayBuffer | Uint8Array,
   filename = 'Imported ODT'
 ): Promise<FormaDocument> {
-  const zip = await JSZip.loadAsync(bytes);
-  const contentFile = zip.file('content.xml');
-  if (!contentFile) {
+  const zip = FastZip.load(bytes);
+  const rawContentXml = zip.readText('content.xml');
+  if (rawContentXml === null) {
     throw new Error('Invalid .odt archive: missing content.xml');
   }
-  const xmlText = (await contentFile.async('string')).replace(/^\uFEFF/, '');
+  const xmlText = rawContentXml.replace(/^\uFEFF/, '');
   const parser = new DOMParser();
   const xmlDoc = parser.parseFromString(xmlText, 'application/xml');
 
@@ -397,12 +397,12 @@ export async function importDocumentFromOdt(
   }
 
   const imageDataMap = new Map<string, string>();
-  for (const [path, file] of Object.entries(zip.files)) {
-    if (file.dir || !/^Pictures\//i.test(path)) continue;
+  for (const path of zip.entries()) {
+    if (!/^Pictures\//i.test(path)) continue;
     const ext = path.split('.').pop()?.toLowerCase() ?? 'png';
     const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : `image/${ext}`;
-    const b64 = await file.async('base64');
-    imageDataMap.set(path, `data:${mime};base64,${b64}`);
+    const b64 = zip.readBase64(path);
+    if (b64) imageDataMap.set(path, `data:${mime};base64,${b64}`);
   }
 
   const officeText = xmlDoc.getElementsByTagNameNS('*', 'text')[0];

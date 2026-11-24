@@ -54,27 +54,37 @@ enum FormaDocExtractors {
         case "pdf":
             guard let pdf = PDFDocument(url: url), !pdf.isLocked else { throw invalid(url) }
             var hadPageText = false
+            var nonWhitespaceChars = 0
+            let scannedPages = min(pdf.pageCount, 60)
             var sections: [String] = []
-            for index in 0..<min(pdf.pageCount, 60) {
+            for index in 0..<scannedPages {
                 guard let page = pdf.page(at: index) else { continue }
                 var text = page.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 hadPageText = hadPageText || !text.isEmpty
+                nonWhitespaceChars += text.filter { !$0.isWhitespace }.count
                 if ocr == true && text.isEmpty { text = recognizeText(page) }
                 if !text.isEmpty { sections.append(section("Page \(index + 1)", text)) }
             }
-            if ocr == false && !hadPageText {
+            let sparseText = !hadPageText || (scannedPages > 0 && (nonWhitespaceChars / scannedPages) < 25)
+            if ocr != true && sparseText {
+                var ocrSections: [String] = []
                 for index in 0..<min(pdf.pageCount, 8) {
                     guard let page = pdf.page(at: index) else { continue }
-                    let text = recognizeText(page)
-                    if !text.isEmpty { sections.append(section("Page \(index + 1)", text)) }
+                    let existing = page.string?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    let text = existing.count >= 25 ? existing : recognizeText(page)
+                    if !text.isEmpty { ocrSections.append(section("Page \(index + 1)", text)) }
+                }
+                if ocrSections.joined().count > sections.joined().count {
+                    sections = ocrSections
                 }
             }
             document.text = sections.joined(separator: "\n\n")
             if includeVisuals { document.images = pdfVisuals(pdf, maxPages: config.pdfVisualPages) }
         case "docx":
             let zip = OfficeArchive(url: url)
-            guard let body = zip.xml("word/document.xml") else { throw invalid(url) }
-            document.text = body.descendants("p").map { $0.descendants("t").map(\.text).joined() }.joined(separator: "\n")
+            guard let docXml = zip.xml("word/document.xml") else { throw invalid(url) }
+            let body = docXml.first("body") ?? docXml
+            document.text = extractDocxBlocks(body).joined(separator: "\n\n")
             if includeVisuals { document.images = zip.visuals(prefix: "word/media/", limit: 3) }
         case "xlsx":
             let zip = OfficeArchive(url: url)
@@ -96,16 +106,17 @@ enum FormaDocExtractors {
                 let id = sheet.attributes.first { $0.key.hasSuffix(":id") }?.value
                 let name = id.flatMap { refs[$0] } ?? "xl/worksheets/sheet\(index + 1).xml"
                 guard let part = zip.xml(name, allowPrefix: true, rowLimit: 200) else { return nil }
-                let rows = part.descendants("row").prefix(200).map { row in
+                let rows: [[String]] = part.descendants("row").prefix(200).map { row in
                     row.children.filter { $0.name == "c" }.compactMap { cell -> String? in
                         let value = cell.first("v")?.text ?? ""
                         if cell.attributes["t"] == "s", let i = Int(value), strings.indices.contains(i) { return strings[i] }
                         if cell.attributes["t"] == "inlineStr" { return cell.descendants("t").map(\.text).joined() }
                         if cell.attributes["t"] == "b" { return value == "1" ? "TRUE" : "FALSE" }
                         return value.isEmpty ? cell.first("f").map { "=" + $0.text } : value
-                    }.joined(separator: "\t")
+                    }
                 }
-                return section("Sheet: \(label)", rows.joined(separator: "\n"))
+                let md = markdownTable(rows)
+                return md.isEmpty ? nil : section("Sheet: \(label)", md)
             }.joined(separator: "\n\n")
         case "pptx":
             let zip = OfficeArchive(url: url)
@@ -128,21 +139,23 @@ enum FormaDocExtractors {
         case "odt", "ods", "odp":
             guard let root = OfficeArchive(url: url).xml("content.xml", allowPrefix: true) else { throw invalid(url) }
             if ext == "ods" {
-                document.text = root.descendants("table").map { table in
+                document.text = root.descendants("table").compactMap { table -> String? in
                     let name = table.attributes["table:name"] ?? "Sheet"
-                    let rows = table.descendants("table-row").prefix(200).map { row in
+                    let rows: [[String]] = table.descendants("table-row").prefix(200).map { row in
                         row.children.filter { $0.name == "table-cell" }.map { cell in
                             cell.descendants("p").map(\.text).joined(separator: " ")
-                        }.joined(separator: "\t")
+                        }
                     }
-                    return section("Sheet: \(name)", rows.joined(separator: "\n"))
+                    let md = markdownTable(rows)
+                    return md.isEmpty ? nil : section("Sheet: \(name)", md)
                 }.joined(separator: "\n\n")
             } else if ext == "odp", !root.descendants("page").isEmpty {
                 document.text = root.descendants("page").enumerated().map { index, slide in
                     section("Slide \(index + 1)", paragraphs(slide))
                 }.joined(separator: "\n\n")
             } else {
-                document.text = paragraphs(root)
+                let textRoot = root.first("body")?.first("text") ?? root
+                document.text = extractOdtBlocks(textRoot).joined(separator: "\n\n")
             }
         case "ipynb":
             let data = try Data(contentsOf: url, options: .mappedIfSafe)
@@ -196,9 +209,7 @@ enum FormaDocExtractors {
             let data = try file.read(upToCount: 512 * 1024) ?? Data()
             document.text = String(decoding: data, as: UTF8.self)
             if ext == "html" || ext == "htm" {
-                document.text = document.text
-                    .replacingOccurrences(of: "(?is)<(script|style)\\b[^>]*>.*?</\\1>", with: "", options: .regularExpression)
-                    .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+                document.text = htmlToMarkdown(document.text)
             }
         }
         document.text = String(document.text.prefix(512 * 1024)).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -274,6 +285,216 @@ enum FormaDocExtractors {
 
     private static func paragraphs(_ root: OfficeXMLNode) -> String {
         root.descendants(["p", "h"]).map(\.text).joined(separator: "\n")
+    }
+
+    private static func markdownTable(_ rawRows: [[String]]) -> String {
+        let nonEmptyRows = rawRows.filter { row in
+            row.contains { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        }
+        guard !nonEmptyRows.isEmpty else { return "" }
+        let colCount = nonEmptyRows.map(\.count).max() ?? 0
+        guard colCount > 0 else { return "" }
+
+        func cleanCell(_ value: String) -> String {
+            value
+                .replacingOccurrences(of: "\r\n", with: " ")
+                .replacingOccurrences(of: "\n", with: " ")
+                .replacingOccurrences(of: "\t", with: " ")
+                .replacingOccurrences(of: "|", with: "\\|")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        func formatRow(_ row: [String]) -> String {
+            let padded = (0..<colCount).map { idx in
+                idx < row.count ? cleanCell(row[idx]) : ""
+            }
+            return "| " + padded.joined(separator: " | ") + " |"
+        }
+
+        let header = formatRow(nonEmptyRows[0])
+        let sep = "| " + Array(repeating: "---", count: colCount).joined(separator: " | ") + " |"
+        let body = nonEmptyRows.dropFirst().map(formatRow)
+        return ([header, sep] + body).joined(separator: "\n")
+    }
+
+    private static func extractDocxBlocks(_ container: OfficeXMLNode) -> [String] {
+        var blocks: [String] = []
+        for child in container.children {
+            switch child.name {
+            case "p":
+                let text = child.descendants("t").map(\.text).joined()
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                let pPr = child.first("pPr")
+                let styleVal = (pPr?.first("pStyle")?.attributes.first {
+                    $0.key == "w:val" || $0.key == "val"
+                }?.value ?? "").lowercased()
+                let prefix: String
+                if styleVal == "title" || styleVal == "heading1" || styleVal == "heading 1" {
+                    prefix = "# "
+                } else if styleVal == "subtitle" || styleVal == "heading2" || styleVal == "heading 2" {
+                    prefix = "## "
+                } else if styleVal == "heading3" || styleVal == "heading 3" {
+                    prefix = "### "
+                } else if styleVal == "heading4" || styleVal == "heading 4" {
+                    prefix = "#### "
+                } else if styleVal == "heading5" || styleVal == "heading 5" {
+                    prefix = "##### "
+                } else if styleVal == "heading6" || styleVal == "heading 6" {
+                    prefix = "###### "
+                } else if styleVal.contains("list") || pPr?.first("numPr") != nil {
+                    prefix = "- "
+                } else {
+                    prefix = ""
+                }
+                blocks.append(prefix + text)
+            case "tbl":
+                let rows: [[String]] = child.children.filter { $0.name == "tr" }.map { tr in
+                    tr.children.filter { $0.name == "tc" }.map { tc in
+                        tc.descendants("p")
+                            .map { $0.descendants("t").map(\.text).joined() }
+                            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+                            .joined(separator: " ")
+                    }
+                }
+                let md = markdownTable(rows)
+                if !md.isEmpty { blocks.append(md) }
+            case "sdt":
+                blocks.append(contentsOf: extractDocxBlocks(child.first("sdtContent") ?? child))
+            default:
+                continue
+            }
+        }
+        return blocks
+    }
+
+    private static func extractOdtBlocks(_ container: OfficeXMLNode) -> [String] {
+        var blocks: [String] = []
+        for child in container.children {
+            switch child.name {
+            case "h":
+                let text = child.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !text.isEmpty else { continue }
+                let rawLevel = child.attributes.first {
+                    $0.key == "text:outline-level" || $0.key == "outline-level"
+                }?.value
+                let level = rawLevel.flatMap(Int.init) ?? 1
+                let hashes = String(repeating: "#", count: max(1, min(6, level)))
+                blocks.append("\(hashes) \(text)")
+            case "p":
+                let text = child.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { blocks.append(text) }
+            case "list":
+                let items = child.descendants("list-item").map { item in
+                    "- " + item.descendants("p").map(\.text).joined(separator: " ")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
+                }.filter { $0 != "- " }
+                if !items.isEmpty { blocks.append(items.joined(separator: "\n")) }
+            case "table":
+                let rows: [[String]] = child.descendants("table-row").prefix(200).map { row in
+                    row.children.filter { $0.name == "table-cell" }.map { cell in
+                        cell.descendants("p").map(\.text).joined(separator: " ")
+                    }
+                }
+                let md = markdownTable(rows)
+                if !md.isEmpty { blocks.append(md) }
+            default:
+                let nested = extractOdtBlocks(child)
+                blocks.append(contentsOf: nested)
+            }
+        }
+        return blocks
+    }
+
+    private static func htmlToMarkdown(_ raw: String) -> String {
+        var text = raw.replacingOccurrences(of: "(?is)<(script|style|noscript)\\b[^>]*>.*?</\\1>", with: "", options: .regularExpression)
+
+        func decodeEntities(_ s: String) -> String {
+            s.replacingOccurrences(of: "&nbsp;", with: " ")
+                .replacingOccurrences(of: "&lt;", with: "<")
+                .replacingOccurrences(of: "&gt;", with: ">")
+                .replacingOccurrences(of: "&quot;", with: "\"")
+                .replacingOccurrences(of: "&#39;", with: "'")
+                .replacingOccurrences(of: "&amp;", with: "&")
+        }
+
+        func stripTags(_ s: String) -> String {
+            decodeEntities(s.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression))
+                .replacingOccurrences(of: "[ \\t]+", with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        func replaceRegex(_ pattern: String, in input: String, transform: ([String]) -> String) -> String {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+                return input
+            }
+            let ns = input as NSString
+            let matches = regex.matches(in: input, range: NSRange(location: 0, length: ns.length))
+            guard !matches.isEmpty else { return input }
+            var out = input
+            for match in matches.reversed() {
+                var groups: [String] = []
+                for idx in 0..<match.numberOfRanges {
+                    let r = match.range(at: idx)
+                    groups.append(r.location != NSNotFound ? ns.substring(with: r) : "")
+                }
+                let replacement = transform(groups)
+                if let swiftRange = Range(match.range, in: out) {
+                    out.replaceSubrange(swiftRange, with: replacement)
+                }
+            }
+            return out
+        }
+
+        text = replaceRegex("<pre\\b[^>]*>(.*?)</pre>", in: text) { groups in
+            let inner = decodeEntities(groups[1].replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression))
+                .trimmingCharacters(in: .newlines)
+            return "\n```\n\(inner)\n```\n"
+        }
+
+        text = replaceRegex("<table\\b[^>]*>(.*?)</table>", in: text) { groups in
+            guard let trRegex = try? NSRegularExpression(pattern: "<tr\\b[^>]*>(.*?)</tr>", options: [.caseInsensitive, .dotMatchesLineSeparators]),
+                  let tdRegex = try? NSRegularExpression(pattern: "<t[hd]\\b[^>]*>(.*?)</t[hd]>", options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+                return stripTags(groups[1])
+            }
+            let tbl = groups[1] as NSString
+            var rows: [[String]] = []
+            for tr in trRegex.matches(in: groups[1], range: NSRange(location: 0, length: tbl.length)).prefix(200) {
+                let rowStr = tbl.substring(with: tr.range(at: 1))
+                let rowNs = rowStr as NSString
+                let cells = tdRegex.matches(in: rowStr, range: NSRange(location: 0, length: rowNs.length)).map { td in
+                    stripTags(rowNs.substring(with: td.range(at: 1)))
+                }
+                if !cells.isEmpty { rows.append(cells) }
+            }
+            let md = markdownTable(rows)
+            return md.isEmpty ? "" : "\n\n\(md)\n\n"
+        }
+
+        text = replaceRegex("<h([1-6])\\b[^>]*>(.*?)</h\\1>", in: text) { groups in
+            let level = max(1, min(6, Int(groups[1]) ?? 1))
+            let inner = stripTags(groups[2])
+            return inner.isEmpty ? "" : "\n\n\(String(repeating: "#", count: level)) \(inner)\n\n"
+        }
+
+        text = replaceRegex("<li\\b[^>]*>(.*?)</li>", in: text) { groups in
+            let inner = stripTags(groups[1])
+            return inner.isEmpty ? "" : "\n- \(inner)"
+        }
+
+        text = replaceRegex("<code\\b[^>]*>(.*?)</code>", in: text) { groups in
+            let inner = stripTags(groups[1])
+            return inner.isEmpty ? "" : "`\(inner)`"
+        }
+
+        text = text
+            .replacingOccurrences(of: "(?i)<br\\s*/?>", with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: "(?i)</?(?:p|div|section|article|blockquote|ul|ol)\\b[^>]*>", with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+        text = decodeEntities(text)
+            .replacingOccurrences(of: "[ \\t]+\\n", with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func stringValue(_ value: Any?) -> String {

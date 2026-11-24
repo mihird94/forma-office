@@ -34,6 +34,15 @@ private struct DocumentChunk: Sendable {
     }
 }
 
+private struct CachedVectorMatrix: @unchecked Sendable {
+    let versionKey: String
+    let dims: Int
+    let rowCount: Int
+    let chunkIds: [Int64]
+    let docIds: [String]
+    let matrix: [Float]
+}
+
 private struct OllamaDiscovery: Sendable {
     let online: Bool
     let embedModel: String
@@ -76,15 +85,28 @@ final class FormaSemanticBackend: @unchecked Sendable {
     private var queryVectors: [String: [Float]] = [:]
 
     private var db: OpaquePointer?
+    private let localWriteLock = NSLock()
+    private var localWriteGeneration: Int64 = 0
+    private let vectorCacheLock = NSLock()
+    private var vectorMatrixCache: [String: CachedVectorMatrix] = [:]
+
+    private let rerankSocket: URL
     private let runtimeLock = NSLock()
     private var runtimeStopping = false
     private var embeddedProcess: Process?
     private var embeddedLastUse: Date?
     private var embeddedIdleTimer: DispatchSourceTimer?
+    private var rerankProcess: Process?
+    private var rerankLastUse: Date?
+    private var rerankIdleTimer: DispatchSourceTimer?
 
     private static let embeddedModelName = "embeddinggemma-2 (built-in)"
     private static let embeddedModelFile = "embeddinggemma-2-Q8_0.gguf"
     private static let embeddedMmprojFile = "mmproj-embeddinggemma-2-Q8_0.gguf"
+    private static let rerankModelCandidates: [(file: String, name: String)] = [
+        ("jina-reranker-v1-turbo-en-Q8_0.gguf", "jina-reranker-v1-turbo-en"),
+        ("bge-reranker-v2-m3-Q4_K_M.gguf", "bge-reranker-v2-m3"),
+    ]
     private static let defaultEmbedModel = "embeddinggemma-2"
     private static let preferredEmbedModels = [
         "embeddinggemma-2",
@@ -127,6 +149,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
         let slot = (1...65_535).contains(port) ? port : 18434
         // macOS limits Unix socket paths to a little over 100 bytes, including in long home paths.
         self.embeddedSocket = URL(fileURLWithPath: "/private/tmp/forma-embed-\(geteuid())/\(slot).sock")
+        self.rerankSocket = URL(fileURLWithPath: "/private/tmp/forma-rerank-\(geteuid())/\(slot).sock")
         self.allowOllamaFallback = allowOllamaFallback
 
         let config = URLSessionConfiguration.ephemeral
@@ -146,12 +169,14 @@ final class FormaSemanticBackend: @unchecked Sendable {
 
     deinit {
         shutdownEmbeddedSync()
+        shutdownRerankSync()
         if let handle = db { sqlite3_close(handle) }
     }
 
     func shutdown() {
         runtimeLock.withLock { runtimeStopping = true }
         shutdownEmbeddedSync()
+        shutdownRerankSync()
     }
 
     func permitsIndexedFile(_ path: String) -> Bool {
@@ -465,48 +490,88 @@ final class FormaSemanticBackend: @unchecked Sendable {
         sqlite3_busy_timeout(handle, 5000)
         // Completed migrations make opening another CLI reader independent of the writer lock.
         let initialized = executeSQL("PRAGMA journal_mode=WAL;") && executeSQL("PRAGMA synchronous=NORMAL;")
-            && (databaseVersion(handle) >= 2 || writeTransaction {
-                if databaseVersion(handle) >= 2 { return true }
-                guard executeSQL("""
-                    CREATE TABLE IF NOT EXISTS docs (
-                        doc_id TEXT PRIMARY KEY,
-                        kind TEXT NOT NULL,
-                        title TEXT NOT NULL,
-                        path TEXT NOT NULL DEFAULT '',
-                        content_hash TEXT NOT NULL DEFAULT '',
-                        updated_at REAL NOT NULL DEFAULT 0,
-                        embed_model TEXT NOT NULL DEFAULT '',
-                        file_mtime REAL NOT NULL DEFAULT 0,
-                        file_size INTEGER NOT NULL DEFAULT 0,
-                        source TEXT NOT NULL DEFAULT 'workspace'
-                    );
-                    CREATE TABLE IF NOT EXISTS chunks (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        doc_id TEXT NOT NULL,
-                        chunk_idx INTEGER NOT NULL,
-                        section_label TEXT NOT NULL DEFAULT '',
-                        text TEXT NOT NULL,
-                        embedding BLOB
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id);
-                    CREATE INDEX IF NOT EXISTS idx_docs_path ON docs(path);
-                    """) else { return false }
-                var columns = Set<String>()
-                guard select(handle, "PRAGMA table_info(docs);", row: { columns.insert(columnText($0, 1)) }) else {
-                    return false
+            && (databaseVersion(handle) >= 3 || writeTransaction {
+                if databaseVersion(handle) < 2 {
+                    guard executeSQL("""
+                        CREATE TABLE IF NOT EXISTS docs (
+                            doc_id TEXT PRIMARY KEY,
+                            kind TEXT NOT NULL,
+                            title TEXT NOT NULL,
+                            path TEXT NOT NULL DEFAULT '',
+                            content_hash TEXT NOT NULL DEFAULT '',
+                            updated_at REAL NOT NULL DEFAULT 0,
+                            embed_model TEXT NOT NULL DEFAULT '',
+                            file_mtime REAL NOT NULL DEFAULT 0,
+                            file_size INTEGER NOT NULL DEFAULT 0,
+                            source TEXT NOT NULL DEFAULT 'workspace'
+                        );
+                        CREATE TABLE IF NOT EXISTS chunks (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            doc_id TEXT NOT NULL,
+                            chunk_idx INTEGER NOT NULL,
+                            section_label TEXT NOT NULL DEFAULT '',
+                            text TEXT NOT NULL,
+                            embedding BLOB,
+                            embedding_q8 BLOB
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_chunks_doc_id ON chunks(doc_id);
+                        CREATE INDEX IF NOT EXISTS idx_docs_path ON docs(path);
+                        """) else { return false }
+                    var columns = Set<String>()
+                    guard select(handle, "PRAGMA table_info(docs);", row: { columns.insert(columnText($0, 1)) }) else {
+                        return false
+                    }
+                    for (name, definition) in [
+                        ("file_mtime", "REAL NOT NULL DEFAULT 0"),
+                        ("file_size", "INTEGER NOT NULL DEFAULT 0"),
+                        ("source", "TEXT NOT NULL DEFAULT 'workspace'"),
+                    ] where !columns.contains(name) {
+                        if !executeSQL("ALTER TABLE docs ADD COLUMN \(name) \(definition);") { return false }
+                    }
+                    if !columns.contains("source"),
+                       !executeSQL("UPDATE docs SET source = 'folder' WHERE doc_id LIKE 'file:%' AND path != '';") {
+                        return false
+                    }
+                    guard createSearchIndex() else { return false }
                 }
-                for (name, definition) in [
-                    ("file_mtime", "REAL NOT NULL DEFAULT 0"),
-                    ("file_size", "INTEGER NOT NULL DEFAULT 0"),
-                    ("source", "TEXT NOT NULL DEFAULT 'workspace'"),
-                ] where !columns.contains(name) {
-                    if !executeSQL("ALTER TABLE docs ADD COLUMN \(name) \(definition);") { return false }
+                if databaseVersion(handle) < 3 {
+                    var chunkColumns = Set<String>()
+                    guard select(handle, "PRAGMA table_info(chunks);", row: { chunkColumns.insert(columnText($0, 1)) }) else {
+                        return false
+                    }
+                    if !chunkColumns.contains("embedding_q8") {
+                        if !executeSQL("ALTER TABLE chunks ADD COLUMN embedding_q8 BLOB;") { return false }
+                    }
+                    var toBackfill: [(id: Int64, blob: Data)] = []
+                    _ = select(handle, "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL AND embedding_q8 IS NULL;") { stmt in
+                        guard let raw = sqlite3_column_blob(stmt, 1) else { return }
+                        let count = Int(sqlite3_column_bytes(stmt, 1)) / MemoryLayout<Float>.stride
+                        guard count > 0 else { return }
+                        var floats = [Float](repeating: 0, count: count)
+                        floats.withUnsafeMutableBytes { dst in
+                            if let base = dst.baseAddress { memcpy(base, raw, count * MemoryLayout<Float>.stride) }
+                        }
+                        let normalized = Self.l2Normalize(floats)
+                        toBackfill.append((sqlite3_column_int64(stmt, 0), Self.encodeInt8Normalized(normalized)))
+                    }
+                    if !toBackfill.isEmpty {
+                        var stmt: OpaquePointer?
+                        defer { sqlite3_finalize(stmt) }
+                        guard sqlite3_prepare_v2(handle, "UPDATE chunks SET embedding_q8 = ? WHERE id = ?;", -1, &stmt, nil) == SQLITE_OK, let stmt else {
+                            return false
+                        }
+                        for row in toBackfill {
+                            sqlite3_reset(stmt)
+                            _ = row.blob.withUnsafeBytes { bytes in
+                                sqlite3_bind_blob(stmt, 1, bytes.baseAddress, Int32(row.blob.count), SQLITE_TRANSIENT)
+                            }
+                            sqlite3_bind_int64(stmt, 2, row.id)
+                            if sqlite3_step(stmt) != SQLITE_DONE { return false }
+                        }
+                    }
+                    if !executeSQL("PRAGMA user_version = 3;") { return false }
                 }
-                if !columns.contains("source"),
-                   !executeSQL("UPDATE docs SET source = 'folder' WHERE doc_id LIKE 'file:%' AND path != '';") {
-                    return false
-                }
-                return createSearchIndex()
+                return true
             })
         if !initialized {
             sqlite3_close(handle)
@@ -560,7 +625,10 @@ final class FormaSemanticBackend: @unchecked Sendable {
 
     private func writeTransaction(_ work: () -> Bool) -> Bool {
         guard executeSQL("BEGIN IMMEDIATE;") else { return false }
-        if work() && executeSQL("COMMIT;") { return true }
+        if work() && executeSQL("COMMIT;") {
+            localWriteLock.withLock { localWriteGeneration &+= 1 }
+            return true
+        }
         executeSQL("ROLLBACK;")
         return false
     }
@@ -860,6 +928,180 @@ final class FormaSemanticBackend: @unchecked Sendable {
         return out
     }
 
+    // MARK: - Embedded Cross-Encoder Reranker (llama-server --reranking)
+
+    private func resolveRerankPaths() -> (binURL: URL, modelURL: URL, modelName: String)? {
+        let fm = FileManager.default
+        let binCandidates = [
+            formaSupportDir.appendingPathComponent("bin/llama-server"),
+            Bundle.main.resourceURL?.appendingPathComponent("bin/llama-server"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/llama-server"),
+            URL(fileURLWithPath: "/usr/local/bin/llama-server"),
+        ].compactMap { $0 }
+
+        guard let binURL = binCandidates.first(where: { fm.isExecutableFile(atPath: $0.path) }) else {
+            return nil
+        }
+        let modelsDir = formaSupportDir.appendingPathComponent("models", isDirectory: true)
+        for candidate in Self.rerankModelCandidates {
+            let modelURL = modelsDir.appendingPathComponent(candidate.file)
+            if fm.fileExists(atPath: modelURL.path) {
+                return (binURL, modelURL, candidate.name)
+            }
+        }
+        return nil
+    }
+
+    private var rerankLockURL: URL {
+        rerankSocket.deletingPathExtension().appendingPathExtension("lock")
+    }
+
+    private func isOwnedRerankSocket() -> Bool {
+        var info = stat()
+        return lstat(rerankSocket.path, &info) == 0 && info.st_uid == geteuid() && info.st_mode & S_IFMT == S_IFSOCK
+    }
+
+    private func rerankSocketResponse(_ endpoint: String, body: Data? = nil, timeout: TimeInterval) -> Data? {
+        guard (try? ensureFormaPrivateDirectory(rerankSocket.deletingLastPathComponent())) != nil,
+              isOwnedRerankSocket() else { return nil }
+        var bytes: UnsafeMutableRawPointer?
+        var length = 0
+        let url = "http://localhost" + endpoint
+        let milliseconds = Int(timeout * 1_000)
+        let status = if let body {
+            body.withUnsafeBytes {
+                forma_socket_http(rerankSocket.path, url, $0.baseAddress, $0.count, milliseconds, &bytes, &length)
+            }
+        } else {
+            forma_socket_http(rerankSocket.path, url, nil, 0, milliseconds, &bytes, &length)
+        }
+        guard let bytes else { return nil }
+        guard status == 200 else { free(bytes); return nil }
+        return Data(bytesNoCopy: bytes, count: length, deallocator: .free)
+    }
+
+    private func resetRerankIdleTimer() {
+        rerankLastUse = Date()
+        rerankIdleTimer?.cancel()
+        rerankIdleTimer = nil
+        guard rerankProcess != nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: searchQueue)
+        timer.schedule(deadline: .now() + 30)
+        timer.setEventHandler { [weak self] in self?.shutdownRerankSync(onlyIfIdle: true) }
+        timer.resume()
+        rerankIdleTimer = timer
+    }
+
+    private func shutdownRerankSync(onlyIfIdle: Bool = false) {
+        guard runtimeLock.withLock({ rerankProcess != nil }) else { return }
+        _ = try? withFormaFileLock(rerankLockURL) {
+            runtimeLock.lock()
+            defer { runtimeLock.unlock() }
+            if onlyIfIdle, let lastUse = rerankLastUse, Date().timeIntervalSince(lastUse) < 29 { return }
+            rerankIdleTimer?.cancel()
+            rerankIdleTimer = nil
+            if let process = rerankProcess, process.isRunning {
+                process.terminate()
+                process.waitUntilExit()
+            }
+            rerankProcess = nil
+            if isOwnedRerankSocket() { _ = unlink(rerankSocket.path) }
+        }
+    }
+
+    private func ensureRerankRunningSync() -> Bool {
+        if rerankSocketResponse("/props", timeout: 0.6) != nil {
+            return true
+        }
+        guard let paths = resolveRerankPaths() else {
+            return false
+        }
+        if let old = rerankProcess, !old.isRunning {
+            rerankProcess = nil
+        }
+        if rerankProcess == nil {
+            if isOwnedRerankSocket(), unlink(rerankSocket.path) != 0 { return false }
+            let proc = Process()
+            proc.executableURL = paths.binURL
+            let binDir = paths.binURL.deletingLastPathComponent()
+            proc.currentDirectoryURL = binDir
+            proc.arguments = [
+                "--model", paths.modelURL.path,
+                "--reranking",
+                "--host", rerankSocket.path,
+                "--ctx-size", "2048",
+                "--ubatch-size", "2048",
+                "--batch-size", "2048",
+            ]
+            var env = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("LLAMA_") && !$0.key.hasPrefix("DYLD_") }
+            env["DYLD_LIBRARY_PATH"] = binDir.path
+            proc.environment = env
+            proc.standardOutput = FileHandle.nullDevice
+            proc.standardError = FileHandle.nullDevice
+            do {
+                try proc.run()
+                rerankProcess = proc
+            } catch {
+                return false
+            }
+        }
+        for _ in 0..<45 {
+            if let proc = rerankProcess, !proc.isRunning {
+                rerankProcess = nil
+                return false
+            }
+            if rerankSocketResponse("/props", timeout: 0.4) != nil {
+                return true
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+        }
+        return false
+    }
+
+    private func rerankViaEmbeddedSync(query: String, documents: [String]) -> [Int: Double]? {
+        guard !documents.isEmpty else { return [:] }
+        for attempt in 0..<2 {
+            guard !runtimeLock.withLock({ runtimeStopping }) else { return nil }
+            let shared = try? withFormaFileLock(rerankLockURL, operation: LOCK_SH) { () -> (ready: Bool, scores: [Int: Double]?) in
+                guard rerankSocketResponse("/props", timeout: 0.5) != nil else { return (false, nil) }
+                defer { runtimeLock.withLock { resetRerankIdleTimer() } }
+                let payload: [String: Any] = [
+                    "query": query,
+                    "documents": documents,
+                    "top_n": documents.count,
+                ]
+                guard let body = try? JSONSerialization.data(withJSONObject: payload),
+                      let data = rerankSocketResponse("/v1/rerank", body: body, timeout: 25),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let rows = json["results"] as? [[String: Any]] else {
+                    return (true, nil)
+                }
+                var out: [Int: Double] = [:]
+                out.reserveCapacity(rows.count)
+                for row in rows {
+                    guard let idx = (row["index"] as? Int) ?? (row["index"] as? NSNumber)?.intValue else { continue }
+                    let score = (row["relevance_score"] as? Double)
+                        ?? (row["relevance_score"] as? NSNumber)?.doubleValue
+                        ?? 0.0
+                    out[idx] = score
+                }
+                return (true, out)
+            }
+            guard let shared else { return nil }
+            if shared.ready { return shared.scores }
+            if attempt == 1 { break }
+            let started = try? withFormaFileLock(rerankLockURL) {
+                runtimeLock.withLock {
+                    guard !runtimeStopping, ensureRerankRunningSync() else { return false }
+                    resetRerankIdleTimer()
+                    return true
+                }
+            }
+            guard started == true else { return nil }
+        }
+        return nil
+    }
+
     private func resolveActiveEmbedEngine(ollama: OllamaDiscovery? = nil) -> ActiveEmbedEngine {
         // Priority 1: Self-contained Forma Embedded EmbeddingGemma 2 (zero Ollama dependency!)
         if let paths = resolveEmbeddedPaths() {
@@ -901,6 +1143,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
     private func getStatusSync() -> [String: Any] {
         let ollama = discoverOllamaModels()
         let engine = resolveActiveEmbedEngine(ollama: ollama)
+        let reranker = resolveRerankPaths()
         let counts = queryCounts()
         return [
             "ollamaOnline": engine.online || ollama.online,
@@ -909,6 +1152,8 @@ final class FormaSemanticBackend: @unchecked Sendable {
             "chatOnline": ollama.online,
             "embedModel": engine.embedModel,
             "multimodal": engine.multimodal,
+            "rerankerReady": reranker != nil,
+            "rerankModel": reranker?.modelName ?? "",
             "chatModels": ollama.chatModels,
             "activeChatModel": ollama.activeChatModel,
             "indexedDocs": counts.docs,
@@ -1036,7 +1281,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
 
                 var statement: OpaquePointer?
                 defer { sqlite3_finalize(statement) }
-                let insert = "INSERT INTO chunks (doc_id, chunk_idx, section_label, text, embedding) VALUES (?, ?, ?, ?, ?);"
+                let insert = "INSERT INTO chunks (doc_id, chunk_idx, section_label, text, embedding, embedding_q8) VALUES (?, ?, ?, ?, ?, ?);"
                 guard sqlite3_prepare_v2(db, insert, -1, &statement, nil) == SQLITE_OK, let statement else { return false }
                 for (index, chunk) in chunks.enumerated() {
                     sqlite3_reset(statement)
@@ -1046,11 +1291,16 @@ final class FormaSemanticBackend: @unchecked Sendable {
                     sqlite3_bind_text(statement, 4, chunk.text, -1, SQLITE_TRANSIENT)
                     if let vector = embeddings[index], !vector.isEmpty {
                         let blob = Self.encodeFloat32LittleEndian(vector)
+                        let q8Blob = Self.encodeInt8Normalized(vector)
                         _ = blob.withUnsafeBytes { bytes in
                             sqlite3_bind_blob(statement, 5, bytes.baseAddress, Int32(blob.count), SQLITE_TRANSIENT)
                         }
+                        _ = q8Blob.withUnsafeBytes { bytes in
+                            sqlite3_bind_blob(statement, 6, bytes.baseAddress, Int32(q8Blob.count), SQLITE_TRANSIENT)
+                        }
                     } else {
                         sqlite3_bind_null(statement, 5)
+                        sqlite3_bind_null(statement, 6)
                     }
                     if sqlite3_step(statement) != SQLITE_DONE { return false }
                 }
@@ -1202,6 +1452,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
             }) else { return ["ok": false, "error": "Could not read indexed folders"] }
             let counts = queryCounts()
             let engine = diskEmbedEngine()
+            let reranker = resolveRerankPaths()
             return [
                 "ok": true, "watchedFolders": config.watchedFolders,
                 "folders": config.watchedFolders.map { root in
@@ -1210,6 +1461,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
                 "includeStandaloneImages": config.includeStandaloneImages, "lastFullSyncAt": config.lastFullSyncAt,
                 "indexedDocs": counts.docs, "indexedChunks": counts.chunks, "backend": engine.backend,
                 "embedModel": engine.embedModel, "multimodal": engine.multimodal,
+                "rerankerReady": reranker != nil, "rerankModel": reranker?.modelName ?? "",
             ]
         } catch {
             return ["ok": false, "error": error.localizedDescription]
@@ -1548,8 +1800,17 @@ final class FormaSemanticBackend: @unchecked Sendable {
     private struct RankedChunk {
         let id: Int64
         let docId: String
-        let score: Double
+        var score: Double
         let hybrid: Bool
+        var reranked: Bool = false
+    }
+
+    private struct CandidateRow {
+        let kind: String
+        let title: String
+        let path: String
+        let sectionLabel: String
+        let rawText: String
     }
 
     private func semanticSearchSync(query: String, kindFilter: String?, limit: Int, lexicalOnly: Bool = false) -> [[String: Any]] {
@@ -1563,7 +1824,6 @@ final class FormaSemanticBackend: @unchecked Sendable {
         // The embed call can start a process. Keep WAL snapshots open only during SQLite reads.
         let queryVector = lexicalOnly ? nil : queryVectorForSearch(trimmed, reader: reader, kind: filter)
         guard sqlite3_exec(reader, "BEGIN;", nil, nil, nil) == SQLITE_OK else { return [] }
-        defer { sqlite3_exec(reader, "ROLLBACK;", nil, nil, nil) }
 
         var keywordMatches = keywordScores(reader, tokens: tokens, kind: filter)
         var bestByDocument: [String: [RankedChunk]] = [:]
@@ -1587,8 +1847,49 @@ final class FormaSemanticBackend: @unchecked Sendable {
             }
         }
         for match in keywordMatches.values { retain(match) }
-        let best = bestByDocument.values.joined().sorted(by: Self.preferredRank)
-        return searchResults(reader, ranked: Array(best.prefix(limit)), tokens: tokens)
+        let sortedBest = bestByDocument.values.joined().sorted(by: Self.preferredRank)
+        let poolSize = lexicalOnly ? limit : min(24, max(limit * 2, 16))
+        var pool = Array(sortedBest.prefix(poolSize))
+        let rows = fetchCandidateRows(reader, ranked: pool)
+        _ = sqlite3_exec(reader, "ROLLBACK;", nil, nil, nil)
+
+        // Optional local cross-encoder reranking pass over non-visual candidates.
+        if !lexicalOnly && pool.count > 1 && resolveRerankPaths() != nil {
+            var rerankIndices: [Int] = []
+            var rerankTexts: [String] = []
+            for (idx, candidate) in pool.enumerated() {
+                guard let row = rows[candidate.id], !row.rawText.hasPrefix("[Visual ·") else { continue }
+                let docText = [row.title, row.sectionLabel, String(row.rawText.prefix(1_000))]
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "\n")
+                rerankIndices.append(idx)
+                rerankTexts.append(docText)
+            }
+            if !rerankTexts.isEmpty, let scores = rerankViaEmbeddedSync(query: trimmed, documents: rerankTexts) {
+                for (reqIdx, poolIdx) in rerankIndices.enumerated() {
+                    guard let logit = scores[reqIdx] else { continue }
+                    let prob = 1.0 / (1.0 + exp(-logit))
+                    pool[poolIdx].score = 0.65 * prob + 0.35 * pool[poolIdx].score
+                    pool[poolIdx].reranked = true
+                }
+                pool.sort(by: Self.preferredRank)
+            }
+        }
+
+        return Array(pool.prefix(limit)).compactMap { candidate in
+            guard let row = rows[candidate.id] else { return nil }
+            let matchType = candidate.reranked ? "reranked" : (candidate.hybrid ? "hybrid" : "lexical")
+            return [
+                "docId": candidate.docId,
+                "kind": row.kind,
+                "title": row.title,
+                "path": row.path,
+                "sectionLabel": row.sectionLabel,
+                "snippet": Self.makeSnippet(text: row.rawText, queryTerms: tokens, maxChars: 240),
+                "score": (candidate.score * 1000).rounded() / 1000,
+                "matchType": matchType,
+            ]
+        }
     }
 
     private static func preferredRank(_ lhs: RankedChunk, _ rhs: RankedChunk) -> Bool {
@@ -1661,28 +1962,151 @@ final class FormaSemanticBackend: @unchecked Sendable {
         return (engine.embedModel, vector)
     }
 
+    private func loadVectorMatrix(
+        _ reader: OpaquePointer, model: String, kind: String?, dims: Int, versionKey: String
+    ) -> CachedVectorMatrix {
+        let condition = kind == nil ? "" : " AND d.kind = ?"
+        let byteCount = dims * MemoryLayout<Float>.stride
+        var chunkIds: [Int64] = []
+        var docIds: [String] = []
+        var matrix: [Float] = []
+        var scratchInt8 = [Int8](repeating: 0, count: dims)
+        var scratchFloat = [Float](repeating: 0, count: dims)
+        var divisor: Float = 127.0
+
+        _ = select(reader, """
+            SELECT c.id, c.doc_id, c.embedding_q8, c.embedding
+            FROM docs d JOIN chunks c ON c.doc_id = d.doc_id
+            WHERE d.embed_model = ? AND (length(c.embedding_q8) = ? OR length(c.embedding) = ?)\(condition);
+            """, bind: { stmt in
+            sqlite3_bind_text(stmt, 1, model, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_int(stmt, 2, Int32(dims))
+            sqlite3_bind_int(stmt, 3, Int32(byteCount))
+            if let kind { sqlite3_bind_text(stmt, 4, kind, -1, SQLITE_TRANSIENT) }
+        }) { stmt in
+            if let q8Blob = sqlite3_column_blob(stmt, 2), Int(sqlite3_column_bytes(stmt, 2)) == dims {
+                scratchInt8.withUnsafeMutableBytes { dst in
+                    if let base = dst.baseAddress { memcpy(base, q8Blob, dims) }
+                }
+                vDSP_vflt8(scratchInt8, 1, &scratchFloat, 1, vDSP_Length(dims))
+                vDSP_vsdiv(scratchFloat, 1, &divisor, &scratchFloat, 1, vDSP_Length(dims))
+                chunkIds.append(sqlite3_column_int64(stmt, 0))
+                docIds.append(columnText(stmt, 1))
+                matrix.append(contentsOf: scratchFloat)
+            } else if let fBlob = sqlite3_column_blob(stmt, 3), Int(sqlite3_column_bytes(stmt, 3)) == byteCount {
+                scratchFloat.withUnsafeMutableBytes { dst in
+                    if let base = dst.baseAddress { memcpy(base, fBlob, byteCount) }
+                }
+                let normalized = Self.l2Normalize(scratchFloat)
+                chunkIds.append(sqlite3_column_int64(stmt, 0))
+                docIds.append(columnText(stmt, 1))
+                matrix.append(contentsOf: normalized)
+            }
+        }
+
+        let entry = CachedVectorMatrix(
+            versionKey: versionKey,
+            dims: dims,
+            rowCount: chunkIds.count,
+            chunkIds: chunkIds,
+            docIds: docIds,
+            matrix: matrix
+        )
+        vectorCacheLock.withLock {
+            if vectorMatrixCache.count >= 2 { vectorMatrixCache.removeAll(keepingCapacity: true) }
+            vectorMatrixCache["\(model)\n\(kind ?? "")"] = entry
+        }
+        return entry
+    }
+
     private func rankVectors(
         _ reader: OpaquePointer, model: String, query: [Float], kind: String?,
         row: (Int64, String, Double) -> Void
     ) {
-        let condition = kind == nil ? "" : " AND d.kind = ?"
-        let byteCount = query.count * MemoryLayout<Float>.stride
-        let length = vDSP_Length(query.count)
-        let buffer = UnsafeMutablePointer<Float>.allocate(capacity: query.count)
+        let dims = query.count
+        guard dims > 0 else { return }
+
+        var dataVersion: Int64 = 0
+        _ = select(reader, "PRAGMA data_version;") { dataVersion = sqlite3_column_int64($0, 0) }
+        let localGen = localWriteLock.withLock { localWriteGeneration }
+        let versionKey = "\(dataVersion):\(localGen)"
+        let cacheKey = "\(model)\n\(kind ?? "")"
+
+        let cached = vectorCacheLock.withLock { vectorMatrixCache[cacheKey] }
+        let entry: CachedVectorMatrix
+        if let cached, cached.versionKey == versionKey && cached.dims == dims {
+            entry = cached
+        } else {
+            entry = loadVectorMatrix(reader, model: model, kind: kind, dims: dims, versionKey: versionKey)
+        }
+
+        let rowCount = entry.rowCount
+        guard rowCount > 0 else { return }
+
+        var scores = [Float](repeating: 0, count: rowCount)
+        entry.matrix.withUnsafeBufferPointer { matPtr in
+            query.withUnsafeBufferPointer { qPtr in
+                scores.withUnsafeMutableBufferPointer { outPtr in
+                    guard let matBase = matPtr.baseAddress,
+                          let qBase = qPtr.baseAddress,
+                          let outBase = outPtr.baseAddress else { return }
+                    vDSP_mmul(matBase, 1, qBase, 1, outBase, 1, vDSP_Length(rowCount), 1, vDSP_Length(dims))
+                }
+            }
+        }
+
+        // Keep top-K candidates in O(N) without sorting the full corpus, then rescore exact float32 vectors.
+        let topK = min(rowCount, 160)
+        var topCandidates: [(index: Int, score: Float)] = []
+        topCandidates.reserveCapacity(topK)
+        var minScoreInTop: Float = -Float.greatestFiniteMagnitude
+        var minPosInTop = 0
+
+        for idx in 0..<rowCount {
+            let s = scores[idx]
+            if topCandidates.count < topK {
+                if s < minScoreInTop {
+                    minScoreInTop = s
+                    minPosInTop = topCandidates.count
+                }
+                topCandidates.append((idx, s))
+            } else if s > minScoreInTop {
+                topCandidates[minPosInTop] = (idx, s)
+                var nextMin: Float = Float.greatestFiniteMagnitude
+                var nextPos = 0
+                for (j, item) in topCandidates.enumerated() {
+                    if item.score < nextMin {
+                        nextMin = item.score
+                        nextPos = j
+                    }
+                }
+                minScoreInTop = nextMin
+                minPosInTop = nextPos
+            }
+        }
+
+        let topChunkIds = topCandidates.map { entry.chunkIds[$0.index] }
+        guard !topChunkIds.isEmpty else { return }
+
+        let byteCount = dims * MemoryLayout<Float>.stride
+        let length = vDSP_Length(dims)
+        let buffer = UnsafeMutablePointer<Float>.allocate(capacity: dims)
         defer { buffer.deallocate() }
+        let placeholders = Array(repeating: "?", count: topChunkIds.count).joined(separator: ",")
+
         query.withUnsafeBufferPointer { coefficients in
             guard let queryValues = coefficients.baseAddress else { return }
             _ = select(reader, """
                 SELECT c.id, c.doc_id, c.embedding
-                FROM docs d JOIN chunks c ON c.doc_id = d.doc_id
-                WHERE d.embed_model = ? AND length(c.embedding) = ?\(condition);
+                FROM chunks c
+                WHERE c.id IN (\(placeholders)) AND length(c.embedding) = ?;
                 """, bind: { stmt in
-                sqlite3_bind_text(stmt, 1, model, -1, SQLITE_TRANSIENT)
-                sqlite3_bind_int(stmt, 2, Int32(byteCount))
-                if let kind { sqlite3_bind_text(stmt, 3, kind, -1, SQLITE_TRANSIENT) }
+                for (i, id) in topChunkIds.enumerated() {
+                    sqlite3_bind_int64(stmt, Int32(i + 1), id)
+                }
+                sqlite3_bind_int(stmt, Int32(topChunkIds.count + 1), Int32(byteCount))
             }) { stmt in
                 guard let blob = sqlite3_column_blob(stmt, 2) else { return }
-                // BLOB alignment is unspecified. Reuse one aligned buffer instead of allocating per row.
                 memcpy(buffer, blob, byteCount)
                 var dot: Float = 0
                 var energy: Float = 0
@@ -1694,10 +2118,10 @@ final class FormaSemanticBackend: @unchecked Sendable {
         }
     }
 
-    private func searchResults(_ reader: OpaquePointer, ranked: [RankedChunk], tokens: [String]) -> [[String: Any]] {
-        guard !ranked.isEmpty else { return [] }
+    private func fetchCandidateRows(_ reader: OpaquePointer, ranked: [RankedChunk]) -> [Int64: CandidateRow] {
+        guard !ranked.isEmpty else { return [:] }
         let placeholders = Array(repeating: "?", count: ranked.count).joined(separator: ",")
-        var rows: [Int64: [String: Any]] = [:]
+        var rows: [Int64: CandidateRow] = [:]
         _ = select(reader, """
             SELECT c.id, d.kind, d.title, d.path, c.section_label, c.text
             FROM chunks c JOIN docs d ON d.doc_id = c.doc_id
@@ -1707,21 +2131,15 @@ final class FormaSemanticBackend: @unchecked Sendable {
                 sqlite3_bind_int64(stmt, Int32(index + 1), candidate.id)
             }
         }) { stmt in
-            rows[sqlite3_column_int64(stmt, 0)] = [
-                "kind": columnText(stmt, 1),
-                "title": columnText(stmt, 2),
-                "path": columnText(stmt, 3),
-                "sectionLabel": columnText(stmt, 4),
-                "snippet": Self.makeSnippet(text: columnText(stmt, 5), queryTerms: tokens, maxChars: 240),
-            ]
+            rows[sqlite3_column_int64(stmt, 0)] = CandidateRow(
+                kind: columnText(stmt, 1),
+                title: columnText(stmt, 2),
+                path: columnText(stmt, 3),
+                sectionLabel: columnText(stmt, 4),
+                rawText: columnText(stmt, 5)
+            )
         }
-        return ranked.compactMap { candidate in
-            guard var row = rows[candidate.id] else { return nil }
-            row["docId"] = candidate.docId
-            row["score"] = (candidate.score * 1000).rounded() / 1000
-            row["matchType"] = candidate.hybrid ? "hybrid" : "lexical"
-            return row
-        }
+        return rows
     }
 
     // MARK: - Local Ollama HTTP Client
@@ -2217,6 +2635,15 @@ final class FormaSemanticBackend: @unchecked Sendable {
             withUnsafeBytes(of: &le) { bytes in
                 data.append(contentsOf: bytes)
             }
+        }
+        return data
+    }
+
+    private static func encodeInt8Normalized(_ values: [Float]) -> Data {
+        var data = Data(capacity: values.count)
+        for v in values {
+            let clamped = max(-127, min(127, Int((v * 127.0).rounded())))
+            data.append(UInt8(bitPattern: Int8(clamped)))
         }
         return data
     }

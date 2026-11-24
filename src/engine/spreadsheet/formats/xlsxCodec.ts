@@ -1,6 +1,6 @@
 import { addXlsxCharts, readXlsxRelatedParts } from './xlsxRelatedParts';
 import ExcelJS from 'exceljs';
-import JSZip from 'jszip';
+import { FastZip } from '../../../utils/fastZip';
 import {
   CellData,
   CellStyle,
@@ -32,15 +32,15 @@ function escapeRegExp(str: string): string {
  * in `.rels` / `.xml` entries, or use root-relative `/xl/...` relationship targets.
  */
 async function normalizeXlsxArchive(ab: ArrayBuffer): Promise<ArrayBuffer> {
-  const zip = await JSZip.loadAsync(ab);
+  const zip = FastZip.load(ab);
 
   // Fast-path probe on small header files (xl/workbook.xml & xl/_rels/workbook.xml.rels)
   // so 20MB+ standard Excel workbooks (180MB+ worksheet XML) skip full-archive string decompression!
-  const wbEntry = zip.file('xl/workbook.xml');
-  const wbRelsEntry = zip.file('xl/_rels/workbook.xml.rels');
-  if (wbEntry) {
-    const wbHead = (await wbEntry.async('string')).slice(0, 600);
-    const relsHead = wbRelsEntry ? (await wbRelsEntry.async('string')).slice(0, 600) : '';
+  const wbXml = zip.readText('xl/workbook.xml');
+  const wbRelsXml = zip.readText('xl/_rels/workbook.xml.rels');
+  if (wbXml !== null) {
+    const wbHead = wbXml.slice(0, 600);
+    const relsHead = wbRelsXml ? wbRelsXml.slice(0, 600) : '';
     const hasPrefixedMainNs = /xmlns:[A-Za-z0-9_]+="http:\/\/schemas\.openxmlformats\.org\/spreadsheetml\/2006\/main"/.test(wbHead);
     const hasBomOrRootRel =
       wbHead.startsWith('\uFEFF') ||
@@ -53,11 +53,12 @@ async function normalizeXlsxArchive(ab: ArrayBuffer): Promise<ArrayBuffer> {
 
   let modified = false;
 
-  for (const [entryName, entry] of Object.entries(zip.files)) {
-    if (entry.dir || (!entryName.endsWith('.xml') && !entryName.endsWith('.rels'))) {
+  for (const entryName of zip.entries()) {
+    if (!entryName.endsWith('.xml') && !entryName.endsWith('.rels')) {
       continue;
     }
-    const orig = await entry.async('string');
+    const orig = zip.readText(entryName);
+    if (orig === null) continue;
     let next = orig.replace(/^\uFEFF/, '');
     const head = next.slice(0, 1024);
 
@@ -84,13 +85,13 @@ async function normalizeXlsxArchive(ab: ArrayBuffer): Promise<ArrayBuffer> {
     }
 
     if (next !== orig) {
-      zip.file(entryName, next);
+      zip.writeText(entryName, next);
       modified = true;
     }
   }
 
   if (!modified) return ab;
-  return zip.generateAsync({ type: 'arraybuffer' });
+  return zip.toArrayBuffer();
 }
 
 function hexToArgb(hex?: string): string | undefined {

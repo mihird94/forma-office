@@ -1,4 +1,4 @@
-import JSZip from 'jszip';
+import { FastZip } from '../../../utils/fastZip';
 import { CellData, CellStyle, NormalizedRange, SheetData, WorkbookData } from '../../../types/spreadsheet';
 import { coordToAddress, parseAddress } from '../address';
 import { evaluateWorkbook } from '../formulaEngine';
@@ -85,9 +85,9 @@ export function openFormulaToExcelFormula(ofFormula: string): string {
  * `styles.xml`, and `content.xml` including OpenFormula formulas & typed cached values.
  */
 export async function exportWorkbookToOds(workbook: WorkbookData): Promise<Uint8Array> {
-  const zip = new JSZip();
+  const zip = new FastZip();
   // ODF spec requires `mimetype` stored uncompressed
-  zip.file('mimetype', ODS_MIME, { compression: 'STORE' });
+  zip.writeText('mimetype', ODS_MIME, { store: true });
 
   const manifestXml = `<?xml version="1.0" encoding="UTF-8"?>
 <manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
@@ -277,11 +277,11 @@ export async function exportWorkbookToOds(workbook: WorkbookData): Promise<Uint8
   </office:body>
 </office:document-content>`;
 
-  zip.file('META-INF/manifest.xml', manifestXml);
-  zip.file('styles.xml', stylesXml);
-  zip.file('content.xml', contentXml);
+  zip.writeText('META-INF/manifest.xml', manifestXml);
+  zip.writeText('styles.xml', stylesXml);
+  zip.writeText('content.xml', contentXml);
 
-  return zip.generateAsync({ type: 'uint8array' });
+  return zip.toUint8Array();
 }
 
 /**
@@ -291,12 +291,12 @@ export async function importWorkbookFromOds(
   bytes: ArrayBuffer | Uint8Array,
   filename = 'Imported ODS'
 ): Promise<WorkbookData> {
-  const zip = await JSZip.loadAsync(bytes);
-  const contentFile = zip.file('content.xml');
-  if (!contentFile) {
+  const zip = FastZip.load(bytes);
+  const rawContentXml = zip.readText('content.xml');
+  if (rawContentXml === null) {
     throw new Error('Invalid .ods archive: missing content.xml');
   }
-  const xmlText = (await contentFile.async('string')).replace(/^\uFEFF/, '');
+  const xmlText = rawContentXml.replace(/^\uFEFF/, '');
   const parser = new DOMParser();
   const doc = parser.parseFromString(xmlText, 'application/xml');
 

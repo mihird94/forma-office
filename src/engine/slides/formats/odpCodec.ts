@@ -1,4 +1,4 @@
-import JSZip from 'jszip';
+import { FastZip } from '../../../utils/fastZip';
 import {
   PresentationData,
   SLIDE_H,
@@ -43,8 +43,8 @@ function parseCm(val: string | null, axis: 'x' | 'y'): number {
  * Opens natively in LibreOffice Impress and PowerPoint.
  */
 export async function exportPresentationToOdp(deck: PresentationData): Promise<Uint8Array> {
-  const zip = new JSZip();
-  zip.file('mimetype', ODP_MIME, { compression: 'STORE' });
+  const zip = new FastZip();
+  zip.writeText('mimetype', ODP_MIME, { store: true });
 
   const manifestXml = `<?xml version="1.0" encoding="UTF-8"?>
 <manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.2">
@@ -119,7 +119,7 @@ export async function exportPresentationToOdp(deck: PresentationData): Promise<U
               const ext = m[2] === 'jpeg' ? 'jpg' : m[2] === 'svg+xml' ? 'svg' : m[2];
               const b64 = m[3];
               const picPath = `Pictures/img_${sIdx}_${eIdx}.${ext}`;
-              zip.file(picPath, b64, { base64: true });
+              zip.writeBase64(picPath, b64);
               manifestPicEntries.push(
                 `  <manifest:file-entry manifest:full-path="${picPath}" manifest:media-type="${mime}"/>`
               );
@@ -184,11 +184,11 @@ export async function exportPresentationToOdp(deck: PresentationData): Promise<U
     manifestPicEntries.length > 0
       ? manifestXml.replace('</manifest:manifest>', `${manifestPicEntries.join('\n')}\n</manifest:manifest>`)
       : manifestXml;
-  zip.file('META-INF/manifest.xml', finalManifest);
-  zip.file('styles.xml', stylesXml);
-  zip.file('content.xml', contentXml);
+  zip.writeText('META-INF/manifest.xml', finalManifest);
+  zip.writeText('styles.xml', stylesXml);
+  zip.writeText('content.xml', contentXml);
 
-  return zip.generateAsync({ type: 'uint8array' });
+  return zip.toUint8Array();
 }
 
 /**
@@ -198,8 +198,8 @@ export async function importPresentationFromOdp(
   bytes: ArrayBuffer | Uint8Array,
   filename = 'Imported ODP'
 ): Promise<PresentationData> {
-  const zip = await JSZip.loadAsync(bytes);
-  const contentStr = await zip.file('content.xml')?.async('string');
+  const zip = FastZip.load(bytes);
+  const contentStr = zip.readText('content.xml');
   if (!contentStr) throw new Error('Invalid .odp archive: missing content.xml');
 
   const parser = new DOMParser();
@@ -259,8 +259,8 @@ export async function importPresentationFromOdp(
         const imgNode = Array.from(child.children).find((c) => c.localName === 'image');
         if (imgNode) {
           const href = imgNode.getAttribute('xlink:href') || imgNode.getAttributeNS('http://www.w3.org/1999/xlink', 'href');
-          if (href && zip.file(href)) {
-            const b64 = await zip.file(href)!.async('base64');
+          if (href && zip.has(href)) {
+            const b64 = zip.readBase64(href) ?? '';
             const ext = href.split('.').pop()?.toLowerCase() || 'png';
             const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : 'image/png';
             elements.push({

@@ -112,28 +112,34 @@ else
   echo "Note: llama-server not found in PATH; install via 'brew install llama.cpp' or copy llama-server into $BIN_DIR"
 fi
 
-# Verify the publisher's SHA-256 for both artifacts before accepting or installing them.
-BASE_URL="https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main"
-for FILE in "embeddinggemma-2-Q8_0.gguf" "mmproj-embeddinggemma-2-Q8_0.gguf"; do
-  DEST="$MODELS_DIR/$FILE"
-  case "$FILE" in
-    embeddinggemma-2-Q8_0.gguf) HASH=2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135 ;;
-    mmproj-embeddinggemma-2-Q8_0.gguf) HASH=0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8 ;;
-  esac
+# Verify the publisher's SHA-256 for embedding + reranker artifacts before accepting or installing them.
+download_verified_model() {
+  local BASE_URL="$1"
+  local FILE="$2"
+  local HASH="$3"
+  local DEST="$MODELS_DIR/$FILE"
   if [ -f "$DEST" ] && printf '%s  %s\n' "$HASH" "$DEST" | shasum -a 256 --check --status; then
     echo "==> Model already cached: $FILE ($(du -h "$DEST" | cut -f1))"
   else
     echo "==> Downloading $FILE into $MODELS_DIR..."
+    local PART
     PART="$(mktemp "$MODELS_DIR/.download.XXXXXX")"
-    trap 'rm -f "$PART"' EXIT
+    trap 'rm -f "$PART"' RETURN
     curl -fL --proto '=https' --proto-redir '=https' --progress-bar "$BASE_URL/$FILE" -o "$PART"
     if ! printf '%s  %s\n' "$HASH" "$PART" | shasum -a 256 --check --status; then
       echo "Checksum verification failed for $FILE" >&2
-      exit 1
+      return 1
     fi
     mv "$PART" "$DEST"
-    trap - EXIT
+    trap - RETURN
   fi
-done
+}
 
-echo "==> Done! Self-contained Forma EmbeddingGemma 2 runtime is ready."
+EMBED_BASE_URL="https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/main"
+download_verified_model "$EMBED_BASE_URL" "embeddinggemma-2-Q8_0.gguf" "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"
+download_verified_model "$EMBED_BASE_URL" "mmproj-embeddinggemma-2-Q8_0.gguf" "0531309472a6bc6f4b146c3736eee7795ec9db1903c25490d3c937490cef6dd8"
+
+RERANK_BASE_URL="https://huggingface.co/gpustack/jina-reranker-v1-turbo-en-GGUF/resolve/main"
+download_verified_model "$RERANK_BASE_URL" "jina-reranker-v1-turbo-en-Q8_0.gguf" "6633027dd42a9490313504ce698dcd8bbd44f8694e58ab555e2d06d8535f4f86"
+
+echo "==> Done! Self-contained Forma EmbeddingGemma 2 + Cross-Encoder Reranker runtime is ready."

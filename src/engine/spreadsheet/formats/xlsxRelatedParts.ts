@@ -1,4 +1,4 @@
-import JSZip from 'jszip';
+import { FastZip } from '../../../utils/fastZip';
 import { ChartSpec, ComputedCell, SheetData, WorkbookData } from '../../../types/spreadsheet';
 import { coordToAddress, parseAddress, parseRange } from '../address';
 import { uid } from '../workbookOps';
@@ -68,8 +68,8 @@ function chartXml(chart: ChartSpec, sheet: SheetData, computed: Record<string, C
 
 export async function addXlsxCharts(bytes: Uint8Array, workbook: WorkbookData, computed: Record<string, Record<string, ComputedCell>>): Promise<Uint8Array> {
   if (!workbook.sheets.some((sheet) => sheet.charts.length)) return bytes;
-  const zip = await JSZip.loadAsync(bytes);
-  let types = await zip.file('[Content_Types].xml')!.async('string');
+  const zip = FastZip.load(bytes);
+  let types = zip.readText('[Content_Types].xml') ?? '';
   let chartNumber = 0;
   for (const [index, sheet] of workbook.sheets.entries()) {
     if (!sheet.charts.length) continue;
@@ -78,26 +78,26 @@ export async function addXlsxCharts(bytes: Uint8Array, workbook: WorkbookData, c
     const relations: string[] = [];
     for (const chart of sheet.charts) {
       const n = ++chartNumber;
-      zip.file(`xl/charts/chart${n}.xml`, chartXml(chart, sheet, computed[sheet.id]));
+      zip.writeText(`xl/charts/chart${n}.xml`, chartXml(chart, sheet, computed[sheet.id]));
       types = types.replace('</Types>', `<Override PartName="/xl/charts/chart${n}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawingml.chart+xml"/></Types>`);
       anchors.push(`<xdr:absoluteAnchor><xdr:pos x="${Math.round(chart.x * 9525)}" y="${Math.round(chart.y * 9525)}"/><xdr:ext cx="${Math.round(chart.width * 9525)}" cy="${Math.round(chart.height * 9525)}"/><xdr:graphicFrame macro=""><xdr:nvGraphicFramePr><xdr:cNvPr id="${n}" name="${xml(chart.title)}"/><xdr:cNvGraphicFramePr/></xdr:nvGraphicFramePr><xdr:xfrm><a:off x="0" y="0"/><a:ext cx="0" cy="0"/></xdr:xfrm><a:graphic><a:graphicData uri="${chartNS}"><c:chart xmlns:c="${chartNS}" r:id="rId${n}"/></a:graphicData></a:graphic></xdr:graphicFrame><xdr:clientData/></xdr:absoluteAnchor>`);
       relations.push(`<Relationship Id="rId${n}" Type="${relationNS}/chart" Target="../charts/chart${n}.xml"/>`);
     }
-    zip.file(`xl/drawings/drawing${sheetNumber}.xml`, `<?xml version="1.0" encoding="UTF-8"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="${drawingNS}" xmlns:r="${relationNS}">${anchors.join('')}</xdr:wsDr>`);
-    zip.file(`xl/drawings/_rels/drawing${sheetNumber}.xml.rels`, `<Relationships xmlns="${packageNS}">${relations.join('')}</Relationships>`);
+    zip.writeText(`xl/drawings/drawing${sheetNumber}.xml`, `<?xml version="1.0" encoding="UTF-8"?><xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing" xmlns:a="${drawingNS}" xmlns:r="${relationNS}">${anchors.join('')}</xdr:wsDr>`);
+    zip.writeText(`xl/drawings/_rels/drawing${sheetNumber}.xml.rels`, `<Relationships xmlns="${packageNS}">${relations.join('')}</Relationships>`);
     types = types.replace('</Types>', `<Override PartName="/xl/drawings/drawing${sheetNumber}.xml" ContentType="application/vnd.openxmlformats-officedocument.drawing+xml"/></Types>`);
     const sheetPath = `xl/worksheets/sheet${sheetNumber}.xml`;
-    const sheetXml = await zip.file(sheetPath)!.async('string');
+    const sheetXml = zip.readText(sheetPath) ?? '';
     const updatedSheetXml = sheetXml.includes('<legacyDrawing')
       ? sheetXml.replace('<legacyDrawing', '<drawing r:id="formaDrawing"/><legacyDrawing')
       : sheetXml.replace('</worksheet>', '<drawing r:id="formaDrawing"/></worksheet>');
-    zip.file(sheetPath, updatedSheetXml);
+    zip.writeText(sheetPath, updatedSheetXml);
     const relPath = `xl/worksheets/_rels/sheet${sheetNumber}.xml.rels`;
-    const rels = await zip.file(relPath)?.async('string') || `<Relationships xmlns="${packageNS}"></Relationships>`;
-    zip.file(relPath, rels.replace('</Relationships>', `<Relationship Id="formaDrawing" Type="${relationNS}/drawing" Target="../drawings/drawing${sheetNumber}.xml"/></Relationships>`));
+    const rels = zip.readText(relPath) || `<Relationships xmlns="${packageNS}"></Relationships>`;
+    zip.writeText(relPath, rels.replace('</Relationships>', `<Relationship Id="formaDrawing" Type="${relationNS}/drawing" Target="../drawings/drawing${sheetNumber}.xml"/></Relationships>`));
   }
-  zip.file('[Content_Types].xml', types);
-  return zip.generateAsync({ type: 'uint8array' });
+  zip.writeText('[Content_Types].xml', types);
+  return zip.toUint8Array();
 }
 
 function readSheetNotes(comments: XMLDocument, sheet: SheetData): void {
@@ -114,10 +114,10 @@ function readSheetNotes(comments: XMLDocument, sheet: SheetData): void {
 }
 
 export async function readXlsxRelatedParts(bytes: ArrayBuffer | Uint8Array, sheets: SheetData[]): Promise<void> {
-  const zip = await JSZip.loadAsync(bytes);
+  const zip = FastZip.load(bytes);
   const parser = new DOMParser();
   const parse = (text: string) => parser.parseFromString(text.replace(/^\uFEFF/, ''), 'application/xml');
-  const readXml = async (path: string) => parse(await zip.file(path)?.async('string') || '<empty/>');
+  const readXml = (path: string) => parse(zip.readText(path) || '<empty/>');
   const resolve = (base: string, target: string) => new URL(target, `https://package/${base}`).pathname.slice(1);
   const getRelId = (el: Element): string | null =>
     el.getAttribute('r:id') || el.getAttributeNS(relationNS, 'id');
@@ -125,10 +125,10 @@ export async function readXlsxRelatedParts(bytes: ArrayBuffer | Uint8Array, shee
     const slash = path.lastIndexOf('/');
     return `${path.slice(0, slash)}/_rels/${path.slice(slash + 1)}.rels`;
   };
-  const relationships = async (path: string) => {
+  const relationships = (path: string) => {
     const rPath = relsPathFor(path);
-    if (!zip.file(rPath)) return new Map<string | null, { path: string; type: string }>();
-    const doc = await readXml(rPath);
+    if (!zip.has(rPath)) return new Map<string | null, { path: string; type: string }>();
+    const doc = readXml(rPath);
     return new Map(Array.from(doc.getElementsByTagNameNS('*', 'Relationship'))
       .filter((rel) => rel.getAttribute('TargetMode') !== 'External')
       .map((rel) => [rel.getAttribute('Id'), {
@@ -136,28 +136,28 @@ export async function readXlsxRelatedParts(bytes: ArrayBuffer | Uint8Array, shee
         type: rel.getAttribute('Type') ?? '',
       }]));
   };
-  const workbookXml = await readXml('xl/workbook.xml');
-  const workbookRels = await relationships('xl/workbook.xml');
+  const workbookXml = readXml('xl/workbook.xml');
+  const workbookRels = relationships('xl/workbook.xml');
   for (const sheetNode of Array.from(workbookXml.getElementsByTagNameNS('*', 'sheet'))) {
     const sheet = sheets.find((s) => s.name === sheetNode.getAttribute('name'));
     const sheetPath = workbookRels.get(getRelId(sheetNode))?.path;
     if (!sheet || !sheetPath) continue;
-    const sheetRels = await relationships(sheetPath);
+    const sheetRels = relationships(sheetPath);
     const relatedParts = Array.from(sheetRels.values());
     const notes = relatedParts.find((rel) => rel.type.endsWith('/comments'));
-    if (notes) readSheetNotes(await readXml(notes.path), sheet);
+    if (notes) readSheetNotes(readXml(notes.path), sheet);
     // Notes can belong to blank cells and can be read without parsing the worksheet grid.
     if (!relatedParts.some((rel) => rel.type.endsWith('/drawing'))) continue;
-    const sheetXml = await readXml(sheetPath);
+    const sheetXml = readXml(sheetPath);
     for (const drawing of Array.from(sheetXml.getElementsByTagNameNS('*', 'drawing'))) {
       const drawingPath = sheetRels.get(getRelId(drawing))?.path;
       if (!drawingPath) continue;
-      const drawingXml = await readXml(drawingPath);
-      const drawingRels = await relationships(drawingPath);
+      const drawingXml = readXml(drawingPath);
+      const drawingRels = relationships(drawingPath);
       for (const reference of Array.from(drawingXml.getElementsByTagNameNS(chartNS, 'chart'))) {
         const chartPath = drawingRels.get(getRelId(reference))?.path;
         if (!chartPath) continue;
-        const chart = await readXml(chartPath);
+        const chart = readXml(chartPath);
         const spec = chart.getElementsByTagNameNS('urn:forma:chart', 'spec')[0];
         if (spec?.textContent) {
           const original = JSON.parse(spec.textContent) as ChartSpec;

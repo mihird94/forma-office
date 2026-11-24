@@ -146,7 +146,11 @@ function llamaProcessesOn(port) {
       const command = execFileSync('/bin/ps', ['-ww', '-p', pid, '-o', 'command='], { encoding: 'utf8' });
       const words = command.trim().split(/\s+/);
       const flag = words.indexOf('--host');
-      return flag >= 0 && words[flag + 1] === `/private/tmp/forma-embed-${process.getuid()}/${port}.sock`;
+      const host = flag >= 0 ? words[flag + 1] : '';
+      return (
+        host === `/private/tmp/forma-embed-${process.getuid()}/${port}.sock` ||
+        host.startsWith(`/private/tmp/forma-rerank-${process.getuid()}/`)
+      );
     } catch (error) {
       if (error.status === 1) return false;
       throw error;
@@ -213,15 +217,17 @@ try {
   await rm(join(root, 'overview.md'));
   const pruned = await run(['sync']);
   assert.equal(pruned.prunedCount, 1);
-  assert.equal((await run(['status'])).indexedDocs, 14);
+  const statusAfterPrune = await run(['status']);
+  assert.equal(statusAfterPrune.indexedDocs, 14);
+  assert.equal(statusAfterPrune.rerankerReady, true, JSON.stringify(statusAfterPrune));
   assert.equal(sql("SELECT count(*) FROM chunk_search WHERE chunk_search MATCH 'saltmarsh';"), '0');
   console.log(JSON.stringify({ check: 'deleted file pruned', ...pruned }));
 
   for (const [ext, title] of Object.entries({ docx: 'summary.docx', xlsx: 'ledger.xlsx', pptx: 'briefing.pptx' })) {
     const search = await run(['search', canaries[ext], '--limit', '1']);
     assert.equal(search.hits[0]?.title, title, JSON.stringify(search.hits));
-    assert.equal(search.hits[0]?.matchType, 'hybrid');
-    console.log(JSON.stringify({ check: ext + ' top-1', match: search.hits[0].title }));
+    assert.ok(['hybrid', 'reranked'].includes(search.hits[0]?.matchType), JSON.stringify(search.hits[0]));
+    console.log(JSON.stringify({ check: ext + ' top-1', match: search.hits[0].title, matchType: search.hits[0].matchType }));
   }
   const visualCases = [
     ['a bar graph with three red orange and green bars increasing in height', 'pdf', 'scan.pdf'],
@@ -262,6 +268,8 @@ try {
   assert.equal((await call('forma_status', {})).indexedDocs, 14);
   assert.equal((await call('forma_search', { query: canaries.docx, limit: 1 })).hits[0].title, 'summary.docx');
   assert.ok((await call('forma_read', { target: join(root, 'summary.docx') })).text.includes(canaries.docx));
+  const xlsxRead = await call('forma_read', { target: join(root, 'ledger.xlsx') });
+  assert.ok(xlsxRead.text.includes('| ') && xlsxRead.text.includes('| --- |'), xlsxRead.text);
   const createdCanvas = await call('forma_create_canvas', {
     path: join(root, 'mcp-architecture.fcanvas'),
     title: 'MCP Acceptance Flow',

@@ -1,5 +1,5 @@
 import PptxGenJS from 'pptxgenjs';
-import JSZip from 'jszip';
+import { FastZip } from '../../../utils/fastZip';
 import {
   PresentationData,
   SLIDE_H,
@@ -163,21 +163,21 @@ export async function exportPresentationToPptx(deck: PresentationData): Promise<
 }
 
 /**
- * Import an OOXML (.pptx) presentation cleanly via JSZip + XML parser.
+ * Import an OOXML (.pptx) presentation cleanly via FastZip + XML parser.
  * Extracts slides, backgrounds, shapes, text boxes, styling, embedded images, and speaker notes.
  */
 export async function importPresentationFromPptx(
   bytes: ArrayBuffer | Uint8Array,
   filename = 'Imported Presentation'
 ): Promise<PresentationData> {
-  const zip = await JSZip.loadAsync(bytes);
+  const zip = FastZip.load(bytes);
   const parser = new DOMParser();
 
   // Detect slide EMU dimensions from ppt/presentation.xml (default 16:9: 9144000 x 5143500 EMU)
   let slideEmuW = 9144000;
   let slideEmuH = 5143500;
   const parseXml = (raw: string) => parser.parseFromString(raw.replace(/^\uFEFF/, ''), 'application/xml');
-  const presXml = await zip.file('ppt/presentation.xml')?.async('string');
+  const presXml = zip.readText('ppt/presentation.xml');
   if (presXml) {
     const presDoc = parseXml(presXml);
     const sldSz = presDoc.getElementsByTagNameNS('*', 'sldSz')[0];
@@ -191,7 +191,7 @@ export async function importPresentationFromPptx(
     }
   }
 
-  const presentationRels = await zip.file('ppt/_rels/presentation.xml.rels')?.async('string');
+  const presentationRels = zip.readText('ppt/_rels/presentation.xml.rels');
   const relationships = new Map<string, string>();
   if (presentationRels) {
     for (const rel of Array.from(parseXml(presentationRels).getElementsByTagNameNS('*', 'Relationship'))) {
@@ -208,7 +208,7 @@ export async function importPresentationFromPptx(
           slide.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'id') ||
           '';
         const path = relationships.get(rId);
-        if (!path || !zip.file(path)) throw new Error('A slide referenced by the presentation is missing');
+        if (!path || !zip.has(path)) throw new Error('A slide referenced by the presentation is missing');
         return path;
       })
     : [];
@@ -220,7 +220,7 @@ export async function importPresentationFromPptx(
     dk2: '#334155',
     lt2: '#f1f5f9',
   };
-  const themeXml = await zip.file('ppt/theme/theme1.xml')?.async('string');
+  const themeXml = zip.readText('ppt/theme/theme1.xml');
   if (themeXml) {
     const tDoc = parseXml(themeXml);
     const clrScheme = tDoc.getElementsByTagNameNS('*', 'clrScheme')[0];
@@ -252,7 +252,7 @@ export async function importPresentationFromPptx(
   const slides: SlideData[] = [];
 
   for (const slidePath of slidePaths) {
-    const xmlStr = await zip.file(slidePath)?.async('string');
+    const xmlStr = zip.readText(slidePath);
     if (!xmlStr) continue;
     const doc = parseXml(xmlStr);
 
@@ -261,7 +261,7 @@ export async function importPresentationFromPptx(
     const relsPath = `ppt/slides/_rels/${slideFileName}.rels`;
     const relMap = new Map<string, string>();
     const relTypes: Array<{ type: string; target: string }> = [];
-    const relsStr = await zip.file(relsPath)?.async('string');
+    const relsStr = zip.readText(relsPath);
     if (relsStr) {
       const relsDoc = parseXml(relsStr);
       for (const rel of Array.from(relsDoc.getElementsByTagNameNS('*', 'Relationship'))) {
@@ -283,20 +283,20 @@ export async function importPresentationFromPptx(
       const layoutTarget = relTypes.find((r) => r.type.endsWith('/slideLayout'))?.target;
       if (layoutTarget) {
         const layoutPath = resolveRelPath(layoutTarget);
-        const layoutXml = await zip.file(layoutPath)?.async('string');
+        const layoutXml = zip.readText(layoutPath);
         if (layoutXml) {
           backgroundColor =
             resolveFillColor(parseXml(layoutXml).getElementsByTagNameNS('*', 'bg')[0]) ?? '';
         }
         if (!backgroundColor) {
           const layoutRelsPath = layoutPath.replace(/([^/]+)$/, '_rels/$1.rels');
-          const layoutRelsStr = await zip.file(layoutRelsPath)?.async('string');
+          const layoutRelsStr = zip.readText(layoutRelsPath);
           if (layoutRelsStr) {
             const masterRel = Array.from(parseXml(layoutRelsStr).getElementsByTagNameNS('*', 'Relationship'))
               .find((r) => (r.getAttribute('Type') || '').endsWith('/slideMaster'));
             const masterTarget = masterRel?.getAttribute('Target');
             if (masterTarget) {
-              const masterXml = await zip.file(resolveRelPath(masterTarget, layoutPath))?.async('string');
+              const masterXml = zip.readText(resolveRelPath(masterTarget, layoutPath));
               if (masterXml) {
                 backgroundColor =
                   resolveFillColor(parseXml(masterXml).getElementsByTagNameNS('*', 'bg')[0]) ?? '';
@@ -443,9 +443,8 @@ export async function importPresentationFromPptx(
           const relTarget = relMap.get(embedId);
           if (!relTarget) continue;
           const resolvedPath = resolveRelPath(relTarget);
-          const imgFile = zip.file(resolvedPath);
-          if (!imgFile) continue;
-          const b64 = await imgFile.async('base64');
+          const b64 = zip.readBase64(resolvedPath);
+          if (b64 === null) continue;
           const ext = resolvedPath.split('.').pop()?.toLowerCase() || 'png';
           const mime = ext === 'jpg' || ext === 'jpeg' ? 'image/jpeg' : ext === 'svg' ? 'image/svg+xml' : 'image/png';
           const xfrm = child.getElementsByTagNameNS('*', 'xfrm')[0];
@@ -514,7 +513,7 @@ export async function importPresentationFromPptx(
           : target.startsWith('../')
             ? `ppt/${target.slice(3)}`
             : `ppt/slides/${target}`;
-        const notesXml = await zip.file(notesPath)?.async('string');
+        const notesXml = zip.readText(notesPath);
         if (notesXml) {
           const nDoc = parseXml(notesXml);
           notes = Array.from(nDoc.getElementsByTagNameNS('*', 't'))

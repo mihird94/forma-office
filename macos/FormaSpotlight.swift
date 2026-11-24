@@ -39,6 +39,7 @@ private struct SpotlightStatus: Sendable {
     let embedOnline: Bool
     let embedModel: String
     let multimodal: Bool
+    let rerankerReady: Bool
 
     init(dictionary: [String: Any]) {
         self.indexedDocs = (dictionary["indexedDocs"] as? Int)
@@ -48,6 +49,7 @@ private struct SpotlightStatus: Sendable {
         self.embedOnline = (dictionary["embedOnline"] as? Bool) ?? false
         self.embedModel = (dictionary["embedModel"] as? String) ?? "embeddinggemma-2"
         self.multimodal = (dictionary["multimodal"] as? Bool) ?? false
+        self.rerankerReady = (dictionary["rerankerReady"] as? Bool) ?? false
     }
 }
 
@@ -559,7 +561,7 @@ private final class SpotlightResultCellView: NSTableCellView {
             sectionLabel.isHidden = false
         }
 
-        if hit.matchType == "hybrid" {
+        if hit.matchType == "hybrid" || hit.matchType == "reranked" {
             let pct = max(1, min(99, Int((hit.score * 100.0).rounded())))
             scoreBadge.configure(text: "AI \(pct)%", tint: .systemIndigo, subtle: false)
         } else {
@@ -583,7 +585,7 @@ private final class SpotlightResultCellView: NSTableCellView {
         if let hit = currentHit {
             let desc = FormaKindDescriptor.descriptor(for: hit.kind)
             kindBadge.configure(text: desc.badgeTitle, tint: desc.accentColor)
-            if hit.matchType == "hybrid" {
+            if hit.matchType == "hybrid" || hit.matchType == "reranked" {
                 let pct = max(1, min(99, Int((hit.score * 100.0).rounded())))
                 scoreBadge.configure(text: "AI \(pct)%", tint: .systemIndigo, subtle: false)
             } else {
@@ -1075,7 +1077,8 @@ private final class FormaSpotlightController: NSObject, NSWindowDelegate, NSText
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let modelLabel: String
         if st.embedOnline {
-            modelLabel = st.multimodal ? "\(cleanModel) (Text + Vision)" : cleanModel
+            let visionLabel = st.multimodal ? "\(cleanModel) (Text + Vision)" : cleanModel
+            modelLabel = st.rerankerReady ? "\(visionLabel) + Rerank" : visionLabel
         } else {
             modelLabel = "Lexical Search"
         }

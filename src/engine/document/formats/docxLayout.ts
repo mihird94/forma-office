@@ -1,4 +1,4 @@
-import JSZip from 'jszip';
+import { FastZip } from '../../../utils/fastZip';
 import type { DocumentPageSettings } from '../../../types/document';
 
 type PageText = Pick<DocumentPageSettings, 'headerText' | 'footerText'>;
@@ -19,8 +19,8 @@ function zipPartPath(from: string, target: string): string | undefined {
   return parts.join('/');
 }
 
-async function readXml(zip: JSZip, path: string): Promise<XMLDocument | undefined> {
-  const xml = await zip.file(path)?.async('string');
+function readXml(zip: FastZip, path: string): XMLDocument | undefined {
+  const xml = zip.readText(path);
   if (!xml) return undefined;
   const doc = new DOMParser().parseFromString(xml, 'application/xml');
   return doc.getElementsByTagName('parsererror').length ? undefined : doc;
@@ -39,12 +39,12 @@ function partText(doc?: XMLDocument): string | undefined {
 }
 
 export async function readDocxLayout(bytes: ArrayBuffer): Promise<{ bytes: ArrayBuffer; pageText: PageText }> {
-  const zip = await JSZip.loadAsync(bytes);
-  const documentRel = relationships(await readXml(zip, '_rels/.rels')).find((rel) =>
+  const zip = FastZip.load(bytes);
+  const documentRel = relationships(readXml(zip, '_rels/.rels')).find((rel) =>
     rel.getAttribute('Type')?.endsWith('/officeDocument') && rel.getAttribute('TargetMode') !== 'External'
   );
   const documentPath = zipPartPath('', documentRel?.getAttribute('Target') ?? '') ?? 'word/document.xml';
-  const document = await readXml(zip, documentPath);
+  const document = readXml(zip, documentPath);
   const ns = document?.documentElement.namespaceURI;
   const pageText: PageText = {};
   if (!document || !ns) return { bytes, pageText };
@@ -53,7 +53,7 @@ export async function readDocxLayout(bytes: ArrayBuffer): Promise<{ bytes: Array
   const section = document.getElementsByTagNameNS(ns, 'sectPr')[0];
   if (section) {
     const relsPath = documentPath.replace(/([^/]+)$/, '_rels/$1.rels');
-    const rels = relationships(await readXml(zip, relsPath));
+    const rels = relationships(readXml(zip, relsPath));
     for (const kind of ['header', 'footer'] as const) {
       const ref = Array.from(section.children).find((el) =>
         el.namespaceURI === ns && el.localName === `${kind}Reference` &&
@@ -65,7 +65,7 @@ export async function readDocxLayout(bytes: ArrayBuffer): Promise<{ bytes: Array
       const rel = id && rels.find((item) => item.getAttribute('Id') === id &&
         item.getAttribute('Type')?.endsWith(`/${kind}`) && item.getAttribute('TargetMode') !== 'External');
       const part = rel && zipPartPath(documentPath, rel.getAttribute('Target') ?? '');
-      if (part) pageText[`${kind}Text`] = partText(await readXml(zip, part));
+      if (part) pageText[`${kind}Text`] = partText(readXml(zip, part));
     }
   }
 
@@ -86,6 +86,6 @@ export async function readDocxLayout(bytes: ArrayBuffer): Promise<{ bytes: Array
   }
 
   if (!inserted) return { bytes, pageText };
-  zip.file(documentPath, new XMLSerializer().serializeToString(document));
-  return { bytes: await zip.generateAsync({ type: 'arraybuffer', compression: 'DEFLATE' }), pageText };
+  zip.writeText(documentPath, new XMLSerializer().serializeToString(document));
+  return { bytes: zip.toArrayBuffer(), pageText };
 }
