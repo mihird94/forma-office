@@ -1,6 +1,27 @@
 # Forma MCP
 
-Forma MCP connects a local assistant to the same index used by the Forma Start Hub and ⌘K search. The stdio server delegates each index operation to `forma-indexer`. Document extraction, Apple Vision OCR, and EmbeddingGemma 2 run on the Mac.
+Forma MCP connects a local assistant to the same index used by the Forma Start Hub and ⌘K search. The stdio server delegates each index operation to `forma-indexer`. Native Swift Markdown extraction, Apple Vision OCR, **EmbeddingGemma 2**, and **`jina-reranker-v1-turbo-en`** cross-encoder reranking all run locally on the Mac.
+
+```mermaid
+flowchart LR
+  Client["MCP Client (Claude Code, Cursor, Gemini CLI)"]
+  Server["mcp/forma-mcp/index.mjs (stdio)"]
+  CLI["forma-indexer CLI"]
+  Extract["Swift Markdownifier + Vision OCR"]
+  Index["SQLite FTS5 + int8/f32 Vectors (vDSP_mmul)"]
+  Embed["EmbeddingGemma 2 (Unix Socket)"]
+  Rerank["jina-reranker-v1-turbo-en (Unix Socket)"]
+  Files["Watched Folders (realpath-scoped)"]
+
+  Client <-->|"JSON-RPC stdio"| Server
+  Server -->|"search, read, status, index"| CLI
+  Server -->|"create & open files"| Files
+  CLI --> Extract
+  Extract --> Index
+  CLI --> Index
+  CLI -.->|"Embeddings"| Embed
+  CLI -.->|"Cross-encoder rerank"| Rerank
+```
 
 Run these commands from the Forma repository.
 
@@ -44,10 +65,10 @@ Add the `forma` entry under `mcpServers` in your MCP client configuration file. 
 
 | Tool | Use |
 | --- | --- |
-| `forma_search` | Find ranked text and visual matches. Optionally filter by kind or limit. |
-| `forma_read` | Read an indexed document by ID or a supported file inside a watched folder. Set `ocr` to include PDF OCR for pages without text. |
+| `forma_search` | Find ranked text and visual matches using SQLite FTS5 + `int8`/`float32` `vDSP_mmul` vectors + `jina-reranker-v1-turbo-en` reranking (`matchType: "reranked"` / `"hybrid"`). Optionally filter by kind or limit. |
+| `forma_read` | Read an indexed document by ID or a supported file inside a watched folder as structured Markdown (headings, lists, and pipe tables for `.docx`, `.odt`, `.xlsx`, `.ods`, `.html`). Automatically runs Vision OCR on sparse PDFs; set `ocr: true` to scan up to 60 pages without text. |
 | `forma_index` | Sync watched folders or index a file or subfolder inside one. Set `force` to reindex unchanged files. |
-| `forma_status` | View index counts, watched folders, the embedding model, and the last completed sync time. |
+| `forma_status` | View index counts, watched folders, `embedModel`, `rerankerReady` / `rerankModel`, and the last completed sync time. |
 | `forma_folders` | List watched folders. Manage watched folders in Forma or through the local CLI. |
 | `forma_open` | Open a file in a watched folder in its native Forma app. |
 | `forma_create_canvas` | Create a `.fcanvas` or `.excalidraw` diagram inside a watched folder from a Mermaid flowchart (`mermaid`) or starter template (`blank`, `architecture`, `mindmap`, `kanban`). Optionally set `open: true` to launch in Forma Canvas. |
