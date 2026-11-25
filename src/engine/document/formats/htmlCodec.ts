@@ -81,6 +81,16 @@ export function detectExternalHtmlOrigins(rawHtml: string): string[] {
   for (const m of hints) { try { origins.add(new URL(m[1]).origin); } catch { /* malformed URL */ } }
   return [...origins].sort();
 }
+
+// Exact HTTPS origins only. Unknown hosts still require an explicit opt-in.
+export const DEFAULT_HTML_CDN_ORIGINS = new Set([
+  'https://cdn.tailwindcss.com',
+  'https://fonts.googleapis.com',
+  'https://fonts.gstatic.com',
+  'https://cdnjs.cloudflare.com',
+  'https://cdn.jsdelivr.net',
+  'https://unpkg.com',
+]);
 function normalizeExternalOrigins(allowExternalOrigins: string[]): string[] {
   const out = new Set<string>();
   for (const origin of allowExternalOrigins) {

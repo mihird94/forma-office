@@ -54,6 +54,34 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { HtmlReviewWorkspace } from '../components/docs/HtmlReviewWorkspace';
 import { vi } from 'vitest';
+import { listWorkspaceFiles } from '../storage/workspaceStore';
+
+it('shows HTML as the format in the recent files list', () => {
+  const doc = importDocumentFromHtml('<html><body><h1>Example</h1></body></html>', 'example.html');
+  expect(listWorkspaceFiles([], [doc])[0].primaryFormat).toBe('.html');
+});
+
+it('enables known CDN origins by default while requiring opt-in for other hosts', async () => {
+  const host = document.createElement('div');
+  document.body.appendChild(host);
+  const root = createRoot(host);
+  const source = '<script src="https://cdn.tailwindcss.com"></script><script src="https://unknown.example/lib.js"></script>';
+  try {
+    await act(async () => { root.render(<HtmlReviewWorkspace source={source} comments={[]} onSourceChange={() => {}} onPin={() => {}} onSelection={() => {}} onSelectComment={() => {}} onConvert={() => {}} />); });
+    const frame = host.querySelector('iframe')!;
+    const policy = () => frame.srcdoc.match(/content="([^"]+)"/)![1];
+    expect(policy()).toContain('https://cdn.tailwindcss.com');
+    expect(policy()).not.toContain('https://unknown.example');
+    await act(async () => { [...host.querySelectorAll('button')].find(b => b.textContent?.includes('Load CDNs'))!.click(); });
+    expect(policy()).toContain('https://unknown.example');
+    await act(async () => { [...host.querySelectorAll('button')].find(b => b.textContent?.includes('CDNs Active'))!.click(); });
+    expect(policy()).not.toContain('https://cdn.tailwindcss.com');
+    expect(policy()).not.toContain('https://unknown.example');
+  } finally {
+    await act(async () => root.unmount());
+    host.remove();
+  }
+});
 
 it('places pins, receives preview selection, and requests conversion', async () => {
   const host = document.createElement('div');

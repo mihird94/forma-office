@@ -18,6 +18,7 @@ import { DocumentExportFormat } from '../../types/office';
 import {
   buildHtmlPreviewDocument,
   buildSandboxedHtmlSrcDoc,
+  DEFAULT_HTML_CDN_ORIGINS,
   detectExternalHtmlOrigins,
   registerNativeHtmlPreview,
 } from '../../engine/document/formats/htmlCodec';
@@ -65,7 +66,8 @@ export const HtmlReviewWorkspace: React.FC<Props> = ({
 }) => {
   const [view, setView] = useState<'preview' | 'split' | 'source'>('preview');
   const [pinMode, setPinMode] = useState(false);
-  const [allowed, setAllowed] = useState<string[]>([]);
+  const [offline, setOffline] = useState(false);
+  const [approvedOrigins, setApprovedOrigins] = useState<string[]>([]);
   const [draftSource, setDraftSource] = useState(source);
   const [nativePreviewUrl, setNativePreviewUrl] = useState<string | null>(null);
   const [showExportMenu, setShowExportMenu] = useState(false);
@@ -125,6 +127,10 @@ export const HtmlReviewWorkspace: React.FC<Props> = ({
   };
 
   const origins = useMemo(() => detectExternalHtmlOrigins(draftSource), [draftSource]);
+  const allowed = useMemo(
+    () => offline ? [] : origins.filter(origin => DEFAULT_HTML_CDN_ORIGINS.has(origin) || approvedOrigins.includes(origin)),
+    [origins, offline, approvedOrigins]
+  );
   const previewDocument = useMemo(() => buildHtmlPreviewDocument(draftSource), [draftSource]);
   const fallbackSrcDoc = useMemo(
     () => buildSandboxedHtmlSrcDoc(draftSource, { allowExternalOrigins: allowed }),
@@ -225,7 +231,7 @@ export const HtmlReviewWorkspace: React.FC<Props> = ({
             hasBlockedOrigins ? (
               <button
                 type="button"
-                onClick={() => setAllowed(origins)}
+                onClick={() => { setApprovedOrigins(origins); setOffline(false); }}
                 title={`Allow external libraries: ${origins.join(', ')}`}
                 className="px-2.5 py-1 rounded-md bg-amber-50 hover:bg-amber-100 border border-amber-300 text-amber-900 text-xs font-medium flex items-center gap-1.5 transition max-w-[260px] truncate"
               >
@@ -235,7 +241,7 @@ export const HtmlReviewWorkspace: React.FC<Props> = ({
             ) : (
               <button
                 type="button"
-                onClick={() => setAllowed([])}
+                onClick={() => { setApprovedOrigins([]); setOffline(true); }}
                 title={`External libraries allowed (${allowed.join(', ')}). Click to lock back to offline sandbox.`}
                 className="px-2.5 py-1 rounded-md bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-xs font-medium flex items-center gap-1.5 transition"
               >

@@ -89,7 +89,7 @@ export function listWorkspaceFiles(
       createdAt: d.createdAt,
       updatedAt: d.updatedAt,
       pinned: Boolean(d.pinned),
-      primaryFormat: '.docx / .odt / .md',
+      primaryFormat: d.sourceFormat === 'html' || d.rawHtmlSource !== undefined ? '.html' : '.docx / .odt / .md',
       previewText: stripped
         ? stripped.slice(0, 110) + (stripped.length > 110 ? '…' : '')
         : 'Blank document',

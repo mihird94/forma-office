@@ -209,7 +209,15 @@ enum FormaDocExtractors {
             let data = try file.read(upToCount: 512 * 1024) ?? Data()
             document.text = String(decoding: data, as: UTF8.self)
             if ext == "html" || ext == "htm" {
-                document.text = htmlToMarkdown(document.text)
+                if let parsed = FormaHTMLExtractor.extract(document.text) {
+                    document.title = parsed.title ?? document.title
+                    document.text = parsed.markdown
+                    if includeVisuals {
+                        document.images = parsed.inlineImages.compactMap { visual(base64: $0.base64, label: $0.label) }
+                    }
+                } else {
+                    document.text = htmlToMarkdown(document.text)
+                }
             }
         }
         document.text = String(document.text.prefix(512 * 1024)).trimmingCharacters(in: .whitespacesAndNewlines)
