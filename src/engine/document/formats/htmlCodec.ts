@@ -1,4 +1,4 @@
-import { FormaDocument } from '../../../types/document';
+import { DocComment, FormaDocument } from '../../../types/document';
 import { uid } from '../../spreadsheet/workbookOps';
 import { sanitizeDocumentHtml } from '../../../utils/documentSecurity';
 
@@ -44,6 +44,8 @@ export function importDocumentFromHtml(html: string, filename = 'Imported HTML')
     title,
     html: sanitizeDocumentHtml(parsed.body?.innerHTML || html),
     sourceFormat: 'html',
+    rawHtmlSource: stripHtmlReviewComments(html),
+    comments: extractHtmlReviewComments(html),
     pageSettings: {
       pageSize: 'letter',
       margins: 'normal',
@@ -52,4 +54,45 @@ export function importDocumentFromHtml(html: string, filename = 'Imported HTML')
     createdAt: now,
     updatedAt: now,
   };
+}
+
+const reviewScript = /<script\b(?=[^>]*\bid\s*=\s*["']forma-review-comments["'])(?=[^>]*\btype\s*=\s*["']application\/forma-comments\+json["'])[^>]*>[\s\S]*?<\/script\s*>/gi;
+
+export function stripHtmlReviewComments(rawHtml: string): string {
+  return rawHtml.replace(reviewScript, '');
+}
+export function extractHtmlReviewComments(rawHtml: string): DocComment[] {
+  const match = rawHtml.match(reviewScript)?.[0];
+  if (!match) return [];
+  try {
+    const value: unknown = JSON.parse(match.replace(/^<script\b[^>]*>/i, '').replace(/<\/script\s*>$/i, ''));
+    return Array.isArray(value) ? value.filter((c): c is DocComment => c && typeof c.id === 'string' && typeof c.text === 'string' && typeof c.author === 'string' && typeof c.createdAt === 'number') : [];
+  } catch { return []; }
+}
+export function exportRawHtmlWithComments(rawHtml: string, comments: DocComment[] = []): string {
+  const clean = stripHtmlReviewComments(rawHtml);
+  if (comments.length === 0) return clean;
+  const block = `<script type="application/forma-comments+json" id="forma-review-comments">${JSON.stringify(comments).replace(/<\/script/gi, '<\\/script')}</script>`;
+  return /<\/body\s*>/i.test(clean) ? clean.replace(/<\/body\s*>/i, () => `${block}\n</body>`) : clean + '\n' + block;
+}
+export function detectExternalHtmlOrigins(rawHtml: string): string[] {
+  const origins = new Set<string>();
+  const hints = rawHtml.matchAll(/(?:<(?:script|img)\b[^>]*\bsrc\s*=\s*["']|<link\b[^>]*\bhref\s*=\s*["']|url\(\s*["']?|(?:import|fetch)\s*\(\s*["']|\bfrom\s*["']|\bimport\s*["']|@import\s*["'])(https?:\/\/[^\s"')<>]+)/gi);
+  for (const m of hints) { try { origins.add(new URL(m[1]).origin); } catch { /* malformed URL */ } }
+  return [...origins].sort();
+}
+export function buildSandboxedHtmlSrcDoc(rawHtml: string, opts: { allowExternalOrigins: string[] }): string {
+  const origins = opts.allowExternalOrigins.filter((origin) => { try { const u = new URL(origin); return (u.protocol === 'http:' || u.protocol === 'https:') && u.origin === origin; } catch { return false; } }).join(' ');
+  const extra = origins ? ` ${origins}` : '';
+  const csp = `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: data:${extra}; style-src 'unsafe-inline' blob: data:${extra}; img-src data: blob:${extra}; font-src data: blob:${extra}; connect-src blob: data:${extra}; worker-src blob:; child-src blob:; media-src data: blob:${extra}; base-uri 'none'; form-action 'none';`;
+  const injection = `<meta http-equiv="Content-Security-Policy" content="${csp}"><script>window.addEventListener('mouseup',function(){var quote=String(window.getSelection()||'').trim();if(quote)window.parent.postMessage({type:'forma-html-selection',quote:quote},'*')});</script>`;
+  const clean = stripHtmlReviewComments(rawHtml);
+  if (/<head\b[^>]*>/i.test(clean)) return clean.replace(/<head\b[^>]*>/i, (head) => head + injection);
+  if (/<html\b[^>]*>/i.test(clean)) return clean.replace(/<html\b[^>]*>/i, (htmlTag) => `${htmlTag}<head>${injection}</head>`);
+  if (/^\s*<!doctype\b[^>]*>/i.test(clean)) return clean.replace(/^\s*<!doctype\b[^>]*>\s*/i, (doctype) => `${doctype}${injection}`);
+  return injection + clean;
+}
+export function formatCommentsForAgent(title: string, comments: DocComment[]): string {
+  const entries = comments.filter(c => !c.resolved).map(c => `${c.pin ? `[Pin ${c.pin.xPct}%, ${c.pin.yPct}%] ` : ''}${c.author}: ${c.text}${c.quote ? `\n> ${c.quote.replace(/\n/g, '\n> ')}` : ''}`);
+  return `# Review Comments: ${title}\n\n${entries.join('\n\n')}`;
 }

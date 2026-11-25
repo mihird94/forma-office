@@ -49,6 +49,7 @@ import {
 } from '../../engine/document/formats/markdownCodec';
 import {
   exportDocumentToHtml,
+  exportRawHtmlWithComments,
   importDocumentFromHtml,
 } from '../../engine/document/formats/htmlCodec';
 import { extractDocVisuals } from '../../engine/document/mermaidSvg';
@@ -63,6 +64,7 @@ import { loadFilePosition, saveFilePosition } from '../../storage/sessionStore';
 import { DocsRibbon } from './DocsRibbon';
 import { DocsOutline } from './DocsOutline';
 import { DocsCommentsPanel } from './DocsCommentsPanel';
+import { HtmlReviewWorkspace } from './HtmlReviewWorkspace';
 import { FindReplaceBar } from './FindReplaceBar';
 import { ContextMenu, ContextMenuItem } from '../common/ContextMenu';
 import {
@@ -352,6 +354,8 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
   const [showComments, setShowComments] = useState(false);
   const [showVisualsTray, setShowVisualsTray] = useState(true);
   const [selectedQuote, setSelectedQuote] = useState('');
+  const [pendingPin, setPendingPin] = useState<DocComment['pin']>();
+  const [selectedComment, setSelectedComment] = useState<string>();
   const [viewMode, setViewMode] = useState<DocsViewMode>(
     () => loadFilePosition(doc.id)?.docsViewMode ?? 'preview'
   );
@@ -838,7 +842,7 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
         const md = snapshot.markdownSource ?? exportDocumentToMarkdown(snapshot);
         savedPath = await triggerFileDownload(md, `${safeName}.md`, 'text/markdown;charset=utf-8');
       } else {
-        const html = exportDocumentToHtml(snapshot);
+        const html = snapshot.rawHtmlSource !== undefined ? exportRawHtmlWithComments(snapshot.rawHtmlSource, snapshot.comments) : exportDocumentToHtml(snapshot);
         savedPath = await triggerFileDownload(html, `${safeName}.html`, 'text/html;charset=utf-8');
       }
       if (wasNativeSaveCancelled(savedPath)) return;
@@ -881,7 +885,7 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
       }
     }
     if (fmt === 'html' && snapshot.nativePath && isNativeWorkspaceAvailable()) {
-      const htmlOut = exportDocumentToHtml(snapshot);
+      const htmlOut = snapshot.rawHtmlSource !== undefined ? exportRawHtmlWithComments(snapshot.rawHtmlSource, snapshot.comments) : exportDocumentToHtml(snapshot);
       const ok = await writeWorkspaceFile(snapshot.nativePath, htmlOut);
       if (ok) {
         onNotify(`Saved ${snapshot.nativePath.split('/').pop()}`);
@@ -920,13 +924,14 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
     [docVisuals]
   );
 
-  const handleAddComment = (payload: { author: string; text: string; quote?: string }) => {
+  const handleAddComment = (payload: { author: string; text: string; quote?: string; pin?: DocComment['pin'] }) => {
     const snapshot = flushPendingHtml(editor);
     const nextComment: DocComment = {
       id: uid('cmt'),
       author: payload.author,
       text: payload.text,
       quote: payload.quote,
+      pin: payload.pin,
       resolved: false,
       createdAt: Date.now(),
     };
@@ -938,6 +943,7 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
     docRef.current = updated;
     onChangeDocument(updated);
     setSelectedQuote('');
+    setPendingPin(undefined);
     onNotify('Added review comment');
   };
 
@@ -1173,6 +1179,30 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
           />
         )}
 
+        {doc.rawHtmlSource !== undefined ? <HtmlReviewWorkspace
+          key={doc.id}
+          source={doc.rawHtmlSource}
+          comments={comments}
+          selectedComment={selectedComment}
+          onSourceChange={(source) => {
+            const snapshot = flushPendingHtml(editor);
+            const html = sanitizeDocumentHtml(new DOMParser().parseFromString(source, 'text/html').body.innerHTML);
+            const updated = { ...snapshot, rawHtmlSource: source, html, updatedAt: Date.now() };
+            docRef.current = updated; onChangeDocument(updated);
+          }}
+          onPin={(pin) => { setPendingPin(pin); setShowComments(true); }}
+          onSelection={(quote) => { setSelectedQuote(quote); setShowComments(true); }}
+          onSelectComment={(id) => { setSelectedComment(id); setShowComments(true); }}
+          onConvert={() => {
+            if (!window.confirm('Convert this HTML to an editable document? Interactive content will be removed.')) return;
+            const snapshot = flushPendingHtml(editor);
+            const html = sanitizeDocumentHtml(new DOMParser().parseFromString(snapshot.rawHtmlSource ?? '', 'text/html').body.innerHTML);
+            editor?.commands.setContent(html, false);
+            lastSyncedHtmlRef.current = html;
+            const updated = { ...snapshot, html, rawHtmlSource: undefined, updatedAt: Date.now() };
+            docRef.current = updated; onChangeDocument(updated);
+          }}
+        /> : <>
         {/* Raw Markdown Source Editor Pane (shown in 'markdown' and 'split' modes) */}
         {(viewMode === 'markdown' || viewMode === 'split') && (
           <section
@@ -1454,12 +1484,18 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
             </section>
           )}
         </main>
+        </>}
 
         {/* Review Comments Right Sidebar */}
         {showComments && (
           <DocsCommentsPanel
             comments={comments}
             selectedQuote={selectedQuote}
+            title={doc.title}
+            pendingPin={pendingPin}
+            onClearPendingPin={() => setPendingPin(undefined)}
+            selectedComment={selectedComment}
+            onSelectComment={setSelectedComment}
             onAddComment={handleAddComment}
             onToggleResolve={handleToggleResolveComment}
             onDeleteComment={handleDeleteComment}

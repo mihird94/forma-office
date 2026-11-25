@@ -1316,9 +1316,9 @@ const WorkspaceApp: React.FC = () => {
               'application/vnd.oasis.opendocument.text'
             );
           } else if (fmt === 'html') {
-            const { exportDocumentToHtml } = await import('./engine/document/formats/htmlCodec');
+            const { exportDocumentToHtml, exportRawHtmlWithComments } = await import('./engine/document/formats/htmlCodec');
             savedPath = await triggerFileDownload(
-              exportDocumentToHtml(doc),
+              doc.rawHtmlSource !== undefined ? exportRawHtmlWithComments(doc.rawHtmlSource, doc.comments) : exportDocumentToHtml(doc),
               `${safe}.html`,
               'text/html;charset=utf-8'
             );
@@ -1674,8 +1674,8 @@ const WorkspaceApp: React.FC = () => {
         }
       }
       if (docFmt === 'html' && doc.nativePath && isNativeWorkspaceAvailable()) {
-        const { exportDocumentToHtml } = await import('./engine/document/formats/htmlCodec');
-        const ok = await writeWorkspaceFile(doc.nativePath, exportDocumentToHtml(doc));
+        const { exportDocumentToHtml, exportRawHtmlWithComments } = await import('./engine/document/formats/htmlCodec');
+        const ok = await writeWorkspaceFile(doc.nativePath, doc.rawHtmlSource !== undefined ? exportRawHtmlWithComments(doc.rawHtmlSource, doc.comments) : exportDocumentToHtml(doc));
         if (ok) {
           notify(`Saved ${doc.nativePath.split('/').pop()}`);
           return;

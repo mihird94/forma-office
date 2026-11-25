@@ -8,6 +8,7 @@ export interface DocComment {
   author: string;
   text: string;
   quote?: string;
+  pin?: { xPct: number; yPct: number; label?: string };
   resolved?: boolean;
   createdAt: number;
 }
@@ -28,6 +29,7 @@ export interface FormaDocument {
   html: string;
   /** Raw Markdown source when opened from or edited as a .md file */
   markdownSource?: string;
+  rawHtmlSource?: string;
   /** Format this document originated from or was last saved as */
   sourceFormat?: DocumentSourceFormat;
   /** Native file path on disk for in-place Cmd+S saving */

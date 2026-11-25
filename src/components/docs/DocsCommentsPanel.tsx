@@ -7,12 +7,18 @@ import {
   Trash2,
   X,
 } from 'lucide-react';
+import { formatCommentsForAgent } from '../../engine/document/formats/htmlCodec';
 import { DocComment } from '../../types/document';
 
 interface DocsCommentsPanelProps {
   comments: DocComment[];
   selectedQuote?: string;
-  onAddComment: (comment: { author: string; text: string; quote?: string }) => void;
+  title?: string;
+  pendingPin?: DocComment['pin'];
+  onClearPendingPin?: () => void;
+  selectedComment?: string;
+  onSelectComment?: (id: string) => void;
+  onAddComment: (comment: { author: string; text: string; quote?: string; pin?: DocComment['pin'] }) => void;
   onToggleResolve: (id: string) => void;
   onDeleteComment: (id: string) => void;
   onJumpToQuote?: (quote: string) => void;
@@ -32,6 +38,11 @@ function formatCommentTime(ts: number): string {
 export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
   comments,
   selectedQuote,
+  title = 'Document',
+  pendingPin,
+  onClearPendingPin,
+  selectedComment,
+  onSelectComment,
   onAddComment,
   onToggleResolve,
   onDeleteComment,
@@ -42,6 +53,7 @@ export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
   const [author, setAuthor] = useState('You');
   const [draftText, setDraftText] = useState('');
   const [capturedQuote, setCapturedQuote] = useState<string>(selectedQuote?.trim() ?? '');
+  const [copiedAgent, setCopiedAgent] = useState(false);
 
   useEffect(() => {
     const next = selectedQuote?.trim() ?? '';
@@ -49,6 +61,10 @@ export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
       setCapturedQuote(next);
     }
   }, [selectedQuote]);
+
+  useEffect(() => {
+    if (selectedComment) document.getElementById(`review-comment-${selectedComment}`)?.scrollIntoView?.({ block: 'nearest' });
+  }, [selectedComment]);
 
   const openCount = comments.filter((c) => !c.resolved).length;
   const visibleComments =
@@ -62,6 +78,7 @@ export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
       author: author.trim() || 'You',
       text: cleaned,
       quote: capturedQuote.trim() || undefined,
+      pin: pendingPin,
     });
     setDraftText('');
     setCapturedQuote('');
@@ -81,13 +98,29 @@ export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
             {openCount}
           </span>
         </div>
-        <button
-          onClick={onClose}
-          title="Close Comments Panel"
-          className="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
-        >
-          <X className="w-3.5 h-3.5" />
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {openCount > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard.writeText(formatCommentsForAgent(title, comments));
+                setCopiedAgent(true);
+                setTimeout(() => setCopiedAgent(false), 1500);
+              }}
+              title="Copy open review comments as Markdown for an AI agent"
+              className="px-2 py-0.5 rounded bg-blue-50 hover:bg-blue-100 text-blue-700 text-[10px] font-semibold transition"
+            >
+              {copiedAgent ? 'Copied' : 'Copy for Agent'}
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            title="Close Comments Panel"
+            className="p-1 rounded text-slate-400 hover:text-slate-700 hover:bg-slate-100 transition"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* Filter Tabs */}
@@ -116,6 +149,21 @@ export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
 
       {/* New Comment Composer */}
       <form onSubmit={handleSubmit} className="p-3 border-b border-slate-200 bg-slate-50/40 space-y-2">
+        {pendingPin && (
+          <div className="flex items-center justify-between gap-2 px-2 py-1 rounded-md bg-blue-50 border border-blue-200/80 text-[11px] text-blue-800">
+            <span className="font-medium">Pin {pendingPin.xPct}%, {pendingPin.yPct}%</span>
+            {onClearPendingPin && (
+              <button
+                type="button"
+                onClick={onClearPendingPin}
+                title="Remove pending pin"
+                className="text-blue-500 hover:text-blue-800 shrink-0"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            )}
+          </div>
+        )}
         {capturedQuote && (
           <div className="flex items-start gap-1.5 px-2 py-1.5 rounded-md bg-amber-50 border border-amber-200/80 text-[11px] text-amber-900">
             <Quote className="w-3 h-3 text-amber-600 shrink-0 mt-0.5" />
@@ -188,8 +236,10 @@ export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
           visibleComments.map((c) => (
             <div
               key={c.id}
+              id={`review-comment-${c.id}`}
+              onClick={() => onSelectComment?.(c.id)}
               className={`rounded-lg border p-2.5 space-y-1.5 transition ${
-                c.resolved
+                selectedComment === c.id ? 'ring-2 ring-blue-400' : c.resolved
                   ? 'bg-slate-50/70 border-slate-200/80 opacity-75'
                   : 'bg-white border-slate-200 shadow-2xs'
               }`}
@@ -229,6 +279,7 @@ export const DocsCommentsPanel: React.FC<DocsCommentsPanelProps> = ({
                 </div>
               </div>
 
+              {c.pin && <div className="text-xs text-blue-700">Pin {c.pin.xPct}%, {c.pin.yPct}%</div>}
               {c.quote && (
                 <button
                   type="button"

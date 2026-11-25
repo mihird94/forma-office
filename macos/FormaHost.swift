@@ -1200,6 +1200,11 @@ final class FormaWindowController: NSObject, NSWindowDelegate, WKNavigationDeleg
             decisionHandler(.allow)
             return
         }
+        if action.targetFrame?.isMainFrame == false, url?.absoluteString == "about:srcdoc",
+           FormaEditorOrigin.isEditor(action.sourceFrame.request.url) {
+            decisionHandler(.allow)
+            return
+        }
         decisionHandler(.cancel)
         if action.navigationType == .linkActivated, action.sourceFrame.isMainFrame,
            FormaEditorOrigin.isEditor(action.sourceFrame.request.url),

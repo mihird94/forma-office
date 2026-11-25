@@ -407,6 +407,23 @@ enum FormaDocExtractors {
     }
 
     private static func htmlToMarkdown(_ raw: String) -> String {
+        var reviewComments: [String] = []
+        if let regex = try? NSRegularExpression(pattern: #"<script\b(?=[^>]*\bid\s*=\s*["']forma-review-comments["'])(?=[^>]*\btype\s*=\s*["']application/forma-comments\+json["'])[^>]*>(.*?)</script\s*>"#, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+            let ns = raw as NSString
+            if let match = regex.firstMatch(in: raw, range: NSRange(location: 0, length: ns.length)),
+               let data = ns.substring(with: match.range(at: 1)).data(using: .utf8),
+               let comments = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] {
+                for comment in comments {
+                    guard let body = comment["text"] as? String else { continue }
+                    let author = comment["author"] as? String ?? "Reviewer"
+                    var line = "- \(author): \(body)"
+                    if (comment["resolved"] as? Bool) == true { line += " (resolved)" }
+                    if let pin = comment["pin"] as? [String: Any], let x = pin["xPct"], let y = pin["yPct"] { line += " [Pin \(x)%, \(y)%]" }
+                    if let quote = comment["quote"] as? String { line += "\n  > \(quote)" }
+                    reviewComments.append(line)
+                }
+            }
+        }
         var text = raw.replacingOccurrences(of: "(?is)<(script|style|noscript)\\b[^>]*>.*?</\\1>", with: "", options: .regularExpression)
 
         func decodeEntities(_ s: String) -> String {
@@ -494,7 +511,8 @@ enum FormaDocExtractors {
         text = decodeEntities(text)
             .replacingOccurrences(of: "[ \\t]+\\n", with: "\n", options: .regularExpression)
             .replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let content = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return reviewComments.isEmpty ? content : content + "\n\n## Review Comments\n\n" + reviewComments.joined(separator: "\n\n")
     }
 
     private static func stringValue(_ value: Any?) -> String {
