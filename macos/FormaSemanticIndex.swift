@@ -747,7 +747,8 @@ final class FormaSemanticBackend: @unchecked Sendable {
     }
 
     private func probeEmbeddedPropsSync(timeout: TimeInterval = 1.0) -> (ready: Bool, hasVision: Bool, mediaMarker: String?) {
-        guard let data = embeddedResponse("/props", timeout: timeout),
+        guard embeddedResponse("/health", timeout: timeout) != nil,
+              let data = embeddedResponse("/props", timeout: timeout),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return (false, false, nil)
         }
@@ -1010,7 +1011,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
     }
 
     private func ensureRerankRunningSync() -> Bool {
-        if rerankSocketResponse("/props", timeout: 0.6) != nil {
+        if rerankSocketResponse("/health", timeout: 0.6) != nil {
             return true
         }
         guard let paths = resolveRerankPaths() else {
@@ -1029,9 +1030,9 @@ final class FormaSemanticBackend: @unchecked Sendable {
                 "--model", paths.modelURL.path,
                 "--reranking",
                 "--host", rerankSocket.path,
-                "--ctx-size", "2048",
-                "--ubatch-size", "2048",
-                "--batch-size", "2048",
+                "--ctx-size", "4096",
+                "--ubatch-size", "4096",
+                "--batch-size", "4096",
             ]
             var env = ProcessInfo.processInfo.environment.filter { !$0.key.hasPrefix("LLAMA_") && !$0.key.hasPrefix("DYLD_") }
             env["DYLD_LIBRARY_PATH"] = binDir.path
@@ -1050,7 +1051,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
                 rerankProcess = nil
                 return false
             }
-            if rerankSocketResponse("/props", timeout: 0.4) != nil {
+            if rerankSocketResponse("/health", timeout: 0.4) != nil {
                 return true
             }
             Thread.sleep(forTimeInterval: 0.2)
@@ -1058,12 +1059,26 @@ final class FormaSemanticBackend: @unchecked Sendable {
         return false
     }
 
+    private static func truncateUTF8(_ text: String, maxBytes: Int) -> String {
+        guard text.utf8.count > maxBytes else { return text }
+        var bytes = 0
+        var end = text.startIndex
+        for idx in text.indices {
+            let next = text.index(after: idx)
+            let charBytes = text[idx..<next].utf8.count
+            if bytes + charBytes > maxBytes { break }
+            bytes += charBytes
+            end = next
+        }
+        return String(text[..<end])
+    }
+
     private func rerankViaEmbeddedSync(query: String, documents: [String]) -> [Int: Double]? {
         guard !documents.isEmpty else { return [:] }
-        for attempt in 0..<2 {
+        for attempt in 0..<3 {
             guard !runtimeLock.withLock({ runtimeStopping }) else { return nil }
             let shared = try? withFormaFileLock(rerankLockURL, operation: LOCK_SH) { () -> (ready: Bool, scores: [Int: Double]?) in
-                guard rerankSocketResponse("/props", timeout: 0.5) != nil else { return (false, nil) }
+                guard rerankSocketResponse("/health", timeout: 0.5) != nil else { return (false, nil) }
                 defer { runtimeLock.withLock { resetRerankIdleTimer() } }
                 let payload: [String: Any] = [
                     "query": query,
@@ -1089,7 +1104,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
             }
             guard let shared else { return nil }
             if shared.ready { return shared.scores }
-            if attempt == 1 { break }
+            if attempt == 2 { break }
             let started = try? withFormaFileLock(rerankLockURL) {
                 runtimeLock.withLock {
                     guard !runtimeStopping, ensureRerankRunningSync() else { return false }
@@ -1859,13 +1874,15 @@ final class FormaSemanticBackend: @unchecked Sendable {
             var rerankTexts: [String] = []
             for (idx, candidate) in pool.enumerated() {
                 guard let row = rows[candidate.id], !row.rawText.hasPrefix("[Visual ·") else { continue }
-                let docText = [row.title, row.sectionLabel, String(row.rawText.prefix(1_000))]
+                let combined = [row.title, row.sectionLabel, row.rawText]
                     .filter { !$0.isEmpty }
                     .joined(separator: "\n")
+                let docText = Self.truncateUTF8(combined, maxBytes: 1_200)
                 rerankIndices.append(idx)
                 rerankTexts.append(docText)
             }
-            if !rerankTexts.isEmpty, let scores = rerankViaEmbeddedSync(query: trimmed, documents: rerankTexts) {
+            let rerankQuery = Self.truncateUTF8(trimmed, maxBytes: 400)
+            if !rerankTexts.isEmpty, let scores = rerankViaEmbeddedSync(query: rerankQuery, documents: rerankTexts) {
                 for (reqIdx, poolIdx) in rerankIndices.enumerated() {
                     guard let logit = scores[reqIdx] else { continue }
                     let prob = 1.0 / (1.0 + exp(-logit))
