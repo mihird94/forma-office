@@ -10,7 +10,7 @@ const contentPolicy = [
   "img-src 'self' forma://app data: blob:",
   "connect-src 'self' forma://app blob: http://127.0.0.1:11434",
   "worker-src 'self' forma://app blob:",
-  "frame-src 'self' about:",
+  "frame-src 'self' about: forma-preview:",
   "object-src 'none'",
   "base-uri 'none'",
   "form-action 'none'",

@@ -1078,6 +1078,20 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
     }
   };
 
+  const isLiveHtmlMode = doc.rawHtmlSource !== undefined;
+  const triggerPrintPdf = () => {
+    const webkit = (
+      window as unknown as {
+        webkit?: { messageHandlers?: { formaPrint?: { postMessage: (p: { title: string }) => void } } };
+      }
+    ).webkit;
+    if (webkit?.messageHandlers?.formaPrint) {
+      webkit.messageHandlers.formaPrint.postMessage({ title: doc.title });
+    } else {
+      window.print();
+    }
+  };
+
   useEffect(() => {
     const w = window as unknown as { __formaToggleReadingMode?: () => void };
     const toggle = () => setShowSidebar((v) => !v);
@@ -1087,7 +1101,7 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
       if ((e.metaKey || e.ctrlKey) && e.key === '\\') {
         e.preventDefault();
         setShowSidebar((v) => !v);
-      } else if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'e') {
+      } else if (!isLiveHtmlMode && (e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'e') {
         e.preventDefault();
         if (e.shiftKey) {
           handleChangeViewMode(viewMode === 'split' ? 'preview' : 'split');
@@ -1101,46 +1115,37 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
       window.removeEventListener('keydown', onKey);
       if (w.__formaToggleReadingMode === toggle) delete w.__formaToggleReadingMode;
     };
-  }, [viewMode]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [viewMode, isLiveHtmlMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
-      <DocsRibbon
-        editor={editor}
-        fontFamily={doc.pageSettings.fontFamily}
-        onChangeFontFamily={(fontFamily) => handleUpdatePageSettings({ fontFamily })}
-        viewMode={viewMode}
-        onChangeViewMode={handleChangeViewMode}
-        sourceFormat={doc.sourceFormat}
-        nativePath={doc.nativePath}
-        onSavePrimary={() => void handleSavePrimary()}
-        showFindReplace={showFindReplace}
-        onToggleFindReplace={() => setShowFindReplace((v) => !v)}
-        readingTheme={readingTheme}
-        onSelectReadingTheme={setReadingTheme}
-        onImportFile={handleImportFile}
-        onExport={handleExport}
-        showComments={showComments}
-        openCommentCount={openCommentCount}
-        onToggleComments={() => setShowComments((v) => !v)}
-        hasDocsFolder={Boolean(docsFolder)}
-        folderSidebarActive={showSidebar && sidebarTab === 'folder'}
-        onClickFolderButton={handleClickFolderButton}
-        onPrintPdf={() => {
-          const webkit = (
-            window as unknown as {
-              webkit?: { messageHandlers?: { formaPrint?: { postMessage: (p: { title: string }) => void } } };
-            }
-          ).webkit;
-          if (webkit?.messageHandlers?.formaPrint) {
-            webkit.messageHandlers.formaPrint.postMessage({ title: doc.title });
-          } else {
-            window.print();
-          }
-        }}
-      />
+      {!isLiveHtmlMode && (
+        <DocsRibbon
+          editor={editor}
+          fontFamily={doc.pageSettings.fontFamily}
+          onChangeFontFamily={(fontFamily) => handleUpdatePageSettings({ fontFamily })}
+          viewMode={viewMode}
+          onChangeViewMode={handleChangeViewMode}
+          sourceFormat={doc.sourceFormat}
+          nativePath={doc.nativePath}
+          onSavePrimary={() => void handleSavePrimary()}
+          showFindReplace={showFindReplace}
+          onToggleFindReplace={() => setShowFindReplace((v) => !v)}
+          readingTheme={readingTheme}
+          onSelectReadingTheme={setReadingTheme}
+          onImportFile={handleImportFile}
+          onExport={handleExport}
+          showComments={showComments}
+          openCommentCount={openCommentCount}
+          onToggleComments={() => setShowComments((v) => !v)}
+          hasDocsFolder={Boolean(docsFolder)}
+          folderSidebarActive={showSidebar && sidebarTab === 'folder'}
+          onClickFolderButton={handleClickFolderButton}
+          onPrintPdf={triggerPrintPdf}
+        />
+      )}
 
-      {showFindReplace && (
+      {!isLiveHtmlMode && showFindReplace && (
         <FindReplaceBar
           query={findQuery}
           onQueryChange={(value) => { setFindQuery(value); setMatchIndex(0); }}
@@ -1153,7 +1158,7 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
       )}
 
       <div className="flex-1 flex min-h-0 overflow-hidden">
-        {showSidebar && (
+        {showSidebar && (!isLiveHtmlMode || (sidebarTab === 'folder' && docsFolder)) && (
           <DocsOutline
             headings={headings}
             pageSettings={doc.pageSettings}
@@ -1179,11 +1184,21 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
           />
         )}
 
-        {doc.rawHtmlSource !== undefined ? <HtmlReviewWorkspace
+        {isLiveHtmlMode ? <HtmlReviewWorkspace
           key={doc.id}
-          source={doc.rawHtmlSource}
+          source={doc.rawHtmlSource ?? ''}
           comments={comments}
           selectedComment={selectedComment}
+          nativePath={doc.nativePath}
+          onSavePrimary={() => void handleSavePrimary()}
+          onExport={handleExport}
+          onPrintPdf={triggerPrintPdf}
+          showComments={showComments}
+          openCommentCount={openCommentCount}
+          onToggleComments={() => setShowComments((v) => !v)}
+          hasDocsFolder={Boolean(docsFolder)}
+          folderSidebarActive={showSidebar && sidebarTab === 'folder'}
+          onClickFolderButton={handleClickFolderButton}
           onSourceChange={(source) => {
             const snapshot = flushPendingHtml(editor);
             const html = sanitizeDocumentHtml(new DOMParser().parseFromString(source, 'text/html').body.innerHTML);
@@ -1682,29 +1697,41 @@ export const DocsApp = forwardRef<DocumentEditorHandle, DocsAppProps>(({
 
       {/* Bottom Status Bar */}
       <div className="no-print h-8 bg-slate-100 border-t border-slate-200 px-4 flex items-center justify-between text-[11px] text-slate-500 shrink-0">
-        <div className="flex items-center gap-4">
-          <button
-            onClick={() => setShowSidebar((v) => !v)}
-            title="Toggle Outline Sidebar (⌘\)"
-            className="text-slate-600 hover:text-blue-700 font-medium transition"
-          >
-            {showSidebar ? 'Hide Outline' : 'Show Outline'}
-          </button>
-          <span>
-            Words: <strong className="text-slate-800 font-mono">{wordCount.toLocaleString()}</strong>
-          </span>
-          <span>
-            Chars: <strong className="text-slate-800 font-mono">{charCount.toLocaleString()}</strong>
-          </span>
-          <span>
-            ~<strong className="text-slate-700 font-mono">{Math.max(1, Math.ceil(wordCount / 220))}</strong> min read
-          </span>
-          <span className="capitalize">
-            Page: <strong className="text-slate-700">{doc.pageSettings.pageSize.toUpperCase()}</strong> ({doc.pageSettings.margins})
-          </span>
-        </div>
+        {isLiveHtmlMode ? (
+          <div className="flex items-center gap-4">
+            <span className="font-medium text-slate-700">Live HTML Review</span>
+            <span>
+              Lines: <strong className="text-slate-800 font-mono">{(doc.rawHtmlSource ?? '').split('\n').length.toLocaleString()}</strong>
+            </span>
+            <span>Sandboxed WebKit Runtime</span>
+          </div>
+        ) : (
+          <div className="flex items-center gap-4">
+            <button
+              onClick={() => setShowSidebar((v) => !v)}
+              title="Toggle Outline Sidebar (⌘\)"
+              className="text-slate-600 hover:text-blue-700 font-medium transition"
+            >
+              {showSidebar ? 'Hide Outline' : 'Show Outline'}
+            </button>
+            <span>
+              Words: <strong className="text-slate-800 font-mono">{wordCount.toLocaleString()}</strong>
+            </span>
+            <span>
+              Chars: <strong className="text-slate-800 font-mono">{charCount.toLocaleString()}</strong>
+            </span>
+            <span>
+              ~<strong className="text-slate-700 font-mono">{Math.max(1, Math.ceil(wordCount / 220))}</strong> min read
+            </span>
+            <span className="capitalize">
+              Page: <strong className="text-slate-700">{doc.pageSettings.pageSize.toUpperCase()}</strong> ({doc.pageSettings.margins})
+            </span>
+          </div>
+        )}
         <div className="flex items-center gap-3">
-          <ZoomControl zoom={zoom} onZoomOut={zoomOut} onZoomIn={zoomIn} onZoomReset={zoomReset} />
+          {!isLiveHtmlMode && (
+            <ZoomControl zoom={zoom} onZoomOut={zoomOut} onZoomIn={zoomIn} onZoomReset={zoomReset} />
+          )}
         </div>
       </div>
     </div>

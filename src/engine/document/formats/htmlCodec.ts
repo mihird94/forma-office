@@ -81,16 +81,85 @@ export function detectExternalHtmlOrigins(rawHtml: string): string[] {
   for (const m of hints) { try { origins.add(new URL(m[1]).origin); } catch { /* malformed URL */ } }
   return [...origins].sort();
 }
-export function buildSandboxedHtmlSrcDoc(rawHtml: string, opts: { allowExternalOrigins: string[] }): string {
-  const origins = opts.allowExternalOrigins.filter((origin) => { try { const u = new URL(origin); return (u.protocol === 'http:' || u.protocol === 'https:') && u.origin === origin; } catch { return false; } }).join(' ');
-  const extra = origins ? ` ${origins}` : '';
-  const csp = `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: data:${extra}; style-src 'unsafe-inline' blob: data:${extra}; img-src data: blob:${extra}; font-src data: blob:${extra}; connect-src blob: data:${extra}; worker-src blob:; child-src blob:; media-src data: blob:${extra}; base-uri 'none'; form-action 'none';`;
-  const injection = `<meta http-equiv="Content-Security-Policy" content="${csp}"><script>window.addEventListener('mouseup',function(){var quote=String(window.getSelection()||'').trim();if(quote)window.parent.postMessage({type:'forma-html-selection',quote:quote},'*')});</script>`;
-  const clean = stripHtmlReviewComments(rawHtml);
+function normalizeExternalOrigins(allowExternalOrigins: string[]): string[] {
+  const out = new Set<string>();
+  for (const origin of allowExternalOrigins) {
+    try {
+      const u = new URL(origin);
+      if ((u.protocol === 'http:' || u.protocol === 'https:') && u.origin === origin) {
+        out.add(u.origin);
+        if (u.origin.toLowerCase() === 'https://fonts.googleapis.com') {
+          out.add('https://fonts.gstatic.com');
+        }
+      }
+    } catch { /* ignore invalid origin */ }
+  }
+  return [...out].sort();
+}
+
+function injectHtmlHeadMarkup(clean: string, injection: string): string {
   if (/<head\b[^>]*>/i.test(clean)) return clean.replace(/<head\b[^>]*>/i, (head) => head + injection);
   if (/<html\b[^>]*>/i.test(clean)) return clean.replace(/<html\b[^>]*>/i, (htmlTag) => `${htmlTag}<head>${injection}</head>`);
   if (/^\s*<!doctype\b[^>]*>/i.test(clean)) return clean.replace(/^\s*<!doctype\b[^>]*>\s*/i, (doctype) => `${doctype}${injection}`);
   return injection + clean;
+}
+
+const SELECTION_BRIDGE_SCRIPT = `<script>window.addEventListener('mouseup',function(){var quote=String(window.getSelection()||'').trim();if(quote)window.parent.postMessage({type:'forma-html-selection',quote:quote},'*')});</script>`;
+
+export function buildHtmlPreviewDocument(rawHtml: string, opts: { includeSelectionBridge?: boolean } = {}): string {
+  const clean = stripHtmlReviewComments(rawHtml);
+  if (opts.includeSelectionBridge === false) return clean;
+  return injectHtmlHeadMarkup(clean, SELECTION_BRIDGE_SCRIPT);
+}
+
+export function buildSandboxedHtmlSrcDoc(rawHtml: string, opts: { allowExternalOrigins: string[] }): string {
+  const origins = normalizeExternalOrigins(opts.allowExternalOrigins).join(' ');
+  const extra = origins ? ` ${origins}` : '';
+  const csp = `default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: data:${extra}; style-src 'unsafe-inline' blob: data:${extra}; img-src data: blob:${extra}; font-src data: blob:${extra}; connect-src blob: data:${extra}; worker-src blob:; child-src blob:; media-src data: blob:${extra}; base-uri 'none'; form-action 'none';`;
+  const injection = `<meta http-equiv="Content-Security-Policy" content="${csp}">${SELECTION_BRIDGE_SCRIPT}`;
+  return injectHtmlHeadMarkup(stripHtmlReviewComments(rawHtml), injection);
+}
+
+const previewWaiters = new Map<string, (url: string) => void>();
+
+export function registerNativeHtmlPreview(html: string, allowedOrigins: string[]): Promise<string | null> {
+  if (typeof window === 'undefined') return Promise.resolve(null);
+  const w = window as unknown as {
+    webkit?: {
+      messageHandlers?: {
+        formaRegisterHtmlPreview?: {
+          postMessage: (payload: { requestId: string; html: string; allowedOrigins: string[] }) => void;
+        };
+      };
+    };
+    __formaResolveHtmlPreview?: (requestId: string, previewUrl: string) => void;
+  };
+  const handler = w.webkit?.messageHandlers?.formaRegisterHtmlPreview;
+  if (!handler) return Promise.resolve(null);
+  if (!w.__formaResolveHtmlPreview) {
+    w.__formaResolveHtmlPreview = (requestId: string, previewUrl: string) => {
+      const resolve = previewWaiters.get(requestId);
+      if (resolve) {
+        previewWaiters.delete(requestId);
+        resolve(previewUrl);
+      }
+    };
+  }
+  const requestId = `hp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (previewWaiters.delete(requestId)) resolve(null);
+    }, 3000);
+    previewWaiters.set(requestId, (previewUrl) => {
+      clearTimeout(timer);
+      resolve(previewUrl || null);
+    });
+    handler.postMessage({
+      requestId,
+      html,
+      allowedOrigins: normalizeExternalOrigins(allowedOrigins),
+    });
+  });
 }
 export function formatCommentsForAgent(title: string, comments: DocComment[]): string {
   const entries = comments.filter(c => !c.resolved).map(c => `${c.pin ? `[Pin ${c.pin.xPct}%, ${c.pin.yPct}%] ` : ''}${c.author}: ${c.text}${c.quote ? `\n> ${c.quote.replace(/\n/g, '\n> ')}` : ''}`);

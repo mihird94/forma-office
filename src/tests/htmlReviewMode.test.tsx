@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildSandboxedHtmlSrcDoc, detectExternalHtmlOrigins, exportRawHtmlWithComments, extractHtmlReviewComments, formatCommentsForAgent, importDocumentFromHtml, stripHtmlReviewComments } from '../engine/document/formats/htmlCodec';
+import { buildSandboxedHtmlSrcDoc, detectExternalHtmlOrigins, exportRawHtmlWithComments, extractHtmlReviewComments, formatCommentsForAgent, importDocumentFromHtml, registerNativeHtmlPreview, stripHtmlReviewComments } from '../engine/document/formats/htmlCodec';
 
 describe('HTML review mode', () => {
   const comment = { id: '1', author: 'A', text: 'Close </script> safely', createdAt: 1, pin: { xPct: 20, yPct: 30 }, quote: 'hello' };
@@ -19,6 +19,29 @@ describe('HTML review mode', () => {
     expect(offline.toLowerCase().startsWith('<!doctype html>')).toBe(true);
     expect(offline).toContain("connect-src blob: data:;");
     expect(buildSandboxedHtmlSrcDoc(html, { allowExternalOrigins: ['https://cdn.example'] })).toContain('connect-src blob: data: https://cdn.example');
+    expect(buildSandboxedHtmlSrcDoc(html, { allowExternalOrigins: ['https://fonts.googleapis.com'] })).toContain('https://fonts.gstatic.com');
+  });
+  it('registers native forma-preview URL when webkit bridge is present', async () => {
+    expect(await registerNativeHtmlPreview('<p>Hi</p>', [])).toBeNull();
+    const w = window as unknown as {
+      webkit?: { messageHandlers?: { formaRegisterHtmlPreview?: { postMessage: (p: { requestId: string }) => void } } };
+      __formaResolveHtmlPreview?: (id: string, url: string) => void;
+    };
+    w.webkit = {
+      messageHandlers: {
+        formaRegisterHtmlPreview: {
+          postMessage: ({ requestId }) => {
+            queueMicrotask(() => w.__formaResolveHtmlPreview?.(requestId, 'forma-preview://doc/tok123'));
+          },
+        },
+      },
+    };
+    try {
+      expect(await registerNativeHtmlPreview('<p>Hi</p>', [])).toBe('forma-preview://doc/tok123');
+    } finally {
+      delete w.webkit;
+      delete w.__formaResolveHtmlPreview;
+    }
   });
   it('formats open comments for an agent', () => {
     expect(formatCommentsForAgent('Test', [comment, { ...comment, id: '2', text: 'resolved', resolved: true }])).toContain('[Pin 20%, 30%]');
@@ -44,8 +67,10 @@ it('places pins, receives preview selection, and requests conversion', async () 
   overlay.getBoundingClientRect = () => ({ left: 0, top: 0, width: 100, height: 100, right: 100, bottom: 100, x: 0, y: 0, toJSON() {} });
   await act(async () => { overlay.dispatchEvent(new MouseEvent('click', { bubbles: true, clientX: 25, clientY: 50 })); });
   expect(onPin).toHaveBeenCalledWith({ xPct: 25, yPct: 50 });
-  const frame = host.querySelector('iframe')!;
+  const frame = host.querySelector('iframe[aria-label="Live HTML Preview"]') as HTMLIFrameElement;
+  expect(frame).toBeTruthy();
   expect(frame.getAttribute('sandbox')).toBe('allow-scripts');
+  expect(frame.hasAttribute('title')).toBe(false);
   await act(async () => { window.dispatchEvent(new MessageEvent('message', { source: frame.contentWindow, data: { type: 'forma-html-selection', quote: 'Hello' } })); });
   expect(onSelection).toHaveBeenCalledWith('Hello');
   await act(async () => { buttons.find(b => b.textContent === 'Convert to Editable Doc')!.click(); });
@@ -76,15 +101,18 @@ it('converts live HTML into a sanitized editable TipTap document', async () => {
   }
   try {
     await act(async () => { root.render(<Harness />); });
-    expect(host.querySelector('iframe[title="Live HTML Preview"]')).toBeTruthy();
-    const convert = [...host.querySelectorAll('button')].find(b => b.textContent === 'Convert to Editable Doc')!;
+    expect(host.querySelector('iframe[aria-label="Live HTML Preview"]')).toBeTruthy();
+    expect(host.textContent).not.toContain('Page Layout');
+    expect(host.textContent).not.toContain('US Letter');
+    const convert = [...host.querySelectorAll('button')].find(b => b.textContent?.includes('Convert to Editable Doc'))!;
     await act(async () => { convert.click(); });
     expect(changed).toHaveBeenCalled();
     const updated: FormaDocument = changed.mock.lastCall![0];
     expect(updated.rawHtmlSource).toBeUndefined();
     expect(updated.html).toContain('Editable content');
     expect(updated.html).not.toContain('<script');
-    expect(host.querySelector('iframe[title="Live HTML Preview"]')).toBeNull();
+    expect(host.querySelector('iframe[aria-label="Live HTML Preview"]')).toBeNull();
+    expect(host.textContent).toContain('Page Layout');
     expect(host.querySelector('.forma-doc-editor')?.textContent).toContain('Editable content');
   } finally {
     await act(async () => root.unmount());

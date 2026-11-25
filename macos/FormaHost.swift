@@ -99,6 +99,67 @@ final class LocalFileRegistry: @unchecked Sendable {
     }
 }
 
+// MARK: - Thread-Safe Isolated HTML Preview Scheme (forma-preview://doc/<token>)
+
+private final class HtmlPreviewRegistry: @unchecked Sendable {
+    static let shared = HtmlPreviewRegistry()
+    private let lock = NSLock()
+    private var entries: [String: (html: String, csp: String)] = [:]
+    private var order: [String] = []
+
+    func register(html: String, csp: String) -> String {
+        let token = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        lock.lock()
+        defer { lock.unlock() }
+        entries[token] = (html, csp)
+        order.append(token)
+        if order.count > 24, let oldest = order.first {
+            order.removeFirst()
+            entries.removeValue(forKey: oldest)
+        }
+        return token
+    }
+
+    func entry(for token: String) -> (html: String, csp: String)? {
+        lock.lock()
+        defer { lock.unlock() }
+        return entries[token]
+    }
+}
+
+private final class HtmlPreviewSchemeHandler: NSObject, WKURLSchemeHandler, @unchecked Sendable {
+    func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
+        guard let url = urlSchemeTask.request.url,
+              url.scheme == "forma-preview",
+              url.host == "doc",
+              (urlSchemeTask.request.httpMethod?.uppercased() ?? "GET") == "GET" else {
+            urlSchemeTask.didFailWithError(URLError(.badURL))
+            return
+        }
+        let token = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        guard !token.isEmpty, let entry = HtmlPreviewRegistry.shared.entry(for: token) else {
+            urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
+            return
+        }
+        let data = Data(entry.html.utf8)
+        let headers: [String: String] = [
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": "\(data.count)",
+            "Content-Security-Policy": entry.csp,
+            "Cache-Control": "no-store",
+        ]
+        if let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers) {
+            urlSchemeTask.didReceive(response)
+            urlSchemeTask.didReceive(data)
+            urlSchemeTask.didFinish()
+        } else {
+            urlSchemeTask.didFailWithError(URLError(.unknown))
+        }
+    }
+
+    func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {}
+}
+
 // MARK: - Bundled Web Asset & Local HTTP-Range Streaming Scheme Handler
 
 private struct UncheckedSchemeTask: @unchecked Sendable {
@@ -862,6 +923,7 @@ final class FormaWindowController: NSObject, NSWindowDelegate, WKNavigationDeleg
 
         let webRoot = Bundle.main.resourceURL!.appendingPathComponent("web")
         config.setURLSchemeHandler(BundledAssetSchemeHandler(webRoot: webRoot), forURLScheme: "forma")
+        config.setURLSchemeHandler(HtmlPreviewSchemeHandler(), forURLScheme: "forma-preview")
 
         self.webView = WKWebView(frame: window.contentView!.bounds, configuration: config)
 
@@ -872,6 +934,7 @@ final class FormaWindowController: NSObject, NSWindowDelegate, WKNavigationDeleg
         contentController.add(self, name: "formaNewWindow")
         contentController.add(self, name: "formaAppReady")
         contentController.add(self, name: "formaResolveLocalPath")
+        contentController.add(self, name: "formaRegisterHtmlPreview")
         contentController.add(self, name: "formaOpenFileDialog")
         if appKind == "lab" { contentController.add(self, name: "formaKernel") }
         contentController.add(self, name: "formaWorkspace")
@@ -1200,7 +1263,8 @@ final class FormaWindowController: NSObject, NSWindowDelegate, WKNavigationDeleg
             decisionHandler(.allow)
             return
         }
-        if action.targetFrame?.isMainFrame == false, url?.absoluteString == "about:srcdoc",
+        if action.targetFrame?.isMainFrame == false,
+           let url, (url.scheme == "forma-preview" || url.absoluteString == "about:srcdoc"),
            FormaEditorOrigin.isEditor(action.sourceFrame.request.url) {
             decisionHandler(.allow)
             return
@@ -1283,6 +1347,37 @@ final class FormaWindowController: NSObject, NSWindowDelegate, WKNavigationDeleg
             webView.callAsyncJavaScript(
                 "window.__formaResolveLocalPathCb && window.__formaResolveLocalPathCb(requestId, streamUrl);",
                 arguments: ["requestId": requestId, "streamUrl": streamUrl],
+                in: nil,
+                in: .page
+            ) { _ in }
+        } else if message.name == "formaRegisterHtmlPreview",
+                  let body = message.body as? [String: Any],
+                  let requestId = body["requestId"] as? String,
+                  let html = body["html"] as? String {
+            let rawOrigins = body["allowedOrigins"] as? [String] ?? []
+            var originSet = Set<String>()
+            for candidate in rawOrigins {
+                let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty,
+                      !trimmed.contains(where: { $0.isWhitespace || $0 == ";" || $0 == "'" || $0 == "\"" }),
+                      let comps = URLComponents(string: trimmed),
+                      let scheme = comps.scheme?.lowercased(), ["http", "https"].contains(scheme),
+                      let host = comps.host, !host.isEmpty,
+                      comps.user == nil, comps.password == nil,
+                      comps.path.isEmpty, comps.query == nil, comps.fragment == nil else { continue }
+                let origin = comps.port.map { "\(scheme)://\(host):\($0)" } ?? "\(scheme)://\(host)"
+                originSet.insert(origin)
+                if origin.lowercased() == "https://fonts.googleapis.com" {
+                    originSet.insert("https://fonts.gstatic.com")
+                }
+            }
+            let extra = originSet.isEmpty ? "" : " " + originSet.sorted().joined(separator: " ")
+            let csp = "default-src 'none'; script-src 'unsafe-inline' 'unsafe-eval' blob: data:\(extra); style-src 'unsafe-inline' blob: data:\(extra); img-src data: blob:\(extra); font-src data: blob:\(extra); connect-src blob: data:\(extra); worker-src blob:; child-src blob:; media-src data: blob:\(extra); base-uri 'none'; form-action 'none';"
+            let token = HtmlPreviewRegistry.shared.register(html: html, csp: csp)
+            let previewUrl = "forma-preview://doc/\(token)"
+            webView.callAsyncJavaScript(
+                "window.__formaResolveHtmlPreview && window.__formaResolveHtmlPreview(requestId, previewUrl);",
+                arguments: ["requestId": requestId, "previewUrl": previewUrl],
                 in: nil,
                 in: .page
             ) { _ in }
