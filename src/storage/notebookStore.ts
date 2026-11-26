@@ -167,7 +167,14 @@ function sendKernelRequest(
       resolve(res);
     });
 
-    handler.postMessage({ ...payload, reqId });
+    try {
+      handler.postMessage({ ...payload, reqId });
+    } catch (error) {
+      clearTimeout(timer);
+      pendingResolvers.delete(reqId);
+      streamListeners.delete(reqId);
+      reject(error);
+    }
   });
 }
 
@@ -235,11 +242,13 @@ export async function traceKernelCode(
 }
 
 export async function restartKernel(pythonPath?: string): Promise<void> {
-  await sendKernelRequest({ action: 'restart', pythonPath }, 10000);
+  const result = await sendKernelRequest({ action: 'restart', pythonPath }, 10000);
+  if (result.ok === false) throw new Error(typeof result.error === 'string' ? result.error : 'Could not restart Python kernel');
 }
 
 export async function interruptKernel(): Promise<void> {
-  await sendKernelRequest({ action: 'interrupt' }, 5000);
+  const result = await sendKernelRequest({ action: 'interrupt' }, 5000);
+  if (result.ok === false) throw new Error(typeof result.error === 'string' ? result.error : 'Could not interrupt Python kernel');
 }
 
 // MARK: - Native Swift Local Folder Workspace Bridge (Forma Lab)

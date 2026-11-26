@@ -473,6 +473,12 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
   const [activeCellId, setActiveCellId] = useState<string>(() => notebook.cells[0]?.id ?? '');
   const [editingMarkdownId, setEditingMarkdownId] = useState<string | null>(null);
   const [runningCellId, setRunningCellId] = useState<string | null>(null);
+  const [runningAll, setRunningAll] = useState(false);
+  const [switchingKernel, setSwitchingKernel] = useState(false);
+  const runSequenceRef = useRef(0);
+  const runAllActiveRef = useRef(false);
+  const kernelTransitionRef = useRef(false);
+  const executionActiveRef = useRef(false);
   const [liveStream, setLiveStream] = useState<{
     cellId: string;
     stdout: string;
@@ -525,17 +531,22 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
 
   // Reset active cell when switching notebook tabs
   useEffect(() => {
+    runSequenceRef.current += 1;
+    runAllActiveRef.current = false;
+    setRunningAll(false);
     setActiveCellId(notebook.cells[0]?.id ?? '');
     setEditingMarkdownId(null);
   }, [notebook.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const updateCells = useCallback(
     (updater: (cells: NotebookCell[]) => NotebookCell[]) => {
-      onChangeNotebook({
+      const next = {
         ...nbRef.current,
         cells: updater(nbRef.current.cells),
         updatedAt: Date.now(),
-      });
+      };
+      nbRef.current = next;
+      onChangeNotebook(next);
     },
     [onChangeNotebook]
   );
@@ -584,6 +595,8 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
       const startNbId = nbRef.current.id;
       const cell = nbRef.current.cells.find((c) => c.id === cellId);
       if (!cell || (cell.cell_type !== 'code' && cell.cell_type !== 'sql')) return false;
+      if (executionActiveRef.current || kernelTransitionRef.current) return false;
+      executionActiveRef.current = true;
       const codeToRun = sourceOverride !== undefined ? sourceOverride : cell.source;
 
       setRunningCellId(cellId);
@@ -624,7 +637,7 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
         if (!mountedRef.current || nbRef.current.id !== startNbId) return false;
         updateCell(cellId, {
           execution_count: res.execution_count,
-          outputs: res.outputs,
+          outputs: res.outputs.length || res.ok ? res.outputs : [{ output_type: 'error', ename: 'KernelError', evalue: res.error ?? 'Execution failed', traceback: [res.error ?? 'Execution failed'] }],
           lastRunMs: res.elapsed_ms,
           stale: false,
         });
@@ -644,8 +657,9 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
         });
         return false;
       } finally {
-        if (mountedRef.current && nbRef.current.id === startNbId) {
-          setRunningCellId(null);
+        executionActiveRef.current = false;
+        if (mountedRef.current) {
+          setRunningCellId((current) => current === cellId ? null : current);
           setLiveStream((prev) => (prev?.cellId === cellId ? null : prev));
         }
       }
@@ -655,6 +669,7 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
 
   const runCellById = useCallback(
     async (cellId: string, advance = false, sourceOverride?: string, forceCascade = false) => {
+      if (runAllActiveRef.current || kernelTransitionRef.current) return;
       const cell = nbRef.current.cells.find((c) => c.id === cellId);
       if (!cell) return;
 
@@ -707,6 +722,8 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
         onNotify('Open this notebook in Forma Lab.app to trace Python execution step-by-step');
         return;
       }
+      if (executionActiveRef.current || kernelTransitionRef.current || runAllActiveRef.current) return;
+      executionActiveRef.current = true;
       setActiveCellId(cellId);
       setRunningCellId(cellId);
       try {
@@ -720,7 +737,9 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
           stale: false,
         });
         setVariables(res.variables);
-        if (res.trace && res.trace.steps.length > 0) {
+        if (!res.ok) {
+          onNotify(`Trace stopped: ${res.error ?? 'execution did not complete'}`);
+        } else if (res.trace && res.trace.steps.length > 0) {
           setCellTraces((prev) => ({
             ...prev,
             [cellId]: { data: res.trace!, stepIndex: 0 },
@@ -733,8 +752,9 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
         if (!mountedRef.current || nbRef.current.id !== startNbId) return;
         onNotify(`Trace failed: ${(err as Error).message}`);
       } finally {
-        if (mountedRef.current && nbRef.current.id === startNbId) {
-          setRunningCellId(null);
+        executionActiveRef.current = false;
+        if (mountedRef.current) {
+          setRunningCellId((current) => current === cellId ? null : current);
         }
       }
     },
@@ -796,24 +816,60 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
       onNotify('Open in Forma Lab.app to execute Python & SQL cells');
       return;
     }
-    for (const cell of nbRef.current.cells) {
-      if (cell.cell_type === 'code' || cell.cell_type === 'sql') {
-        await runSingleCell(cell.id);
+    if (runAllActiveRef.current || kernelTransitionRef.current || executionActiveRef.current) return;
+    const sequence = ++runSequenceRef.current;
+    const notebookId = nbRef.current.id;
+    const cellIds = nbRef.current.cells.filter(cell => cell.cell_type === 'code' || cell.cell_type === 'sql').map(cell => cell.id);
+    runAllActiveRef.current = true;
+    setRunningAll(true);
+    try {
+      for (const id of cellIds) {
+        if (!mountedRef.current || nbRef.current.id !== notebookId || sequence !== runSequenceRef.current) return;
+        const ok = await runSingleCell(id);
+        if (!mountedRef.current || nbRef.current.id !== notebookId || sequence !== runSequenceRef.current) return;
+        if (!ok) {
+          onNotify('Run All stopped because a cell did not complete');
+          return;
+        }
+      }
+      onNotify('Finished running all cells');
+    } finally {
+      if (sequence === runSequenceRef.current) {
+        runAllActiveRef.current = false;
+        if (mountedRef.current) setRunningAll(false);
       }
     }
-    onNotify('Finished running all cells');
   }, [kernelAvailable, runSingleCell, onNotify]);
 
   const handleRestartKernel = async (nextPythonPath?: string) => {
     const targetPath = nextPythonPath ?? activePythonPath;
-    if (nextPythonPath) setActivePythonPath(nextPythonPath);
-    if (!kernelAvailable) return;
+    if (!kernelAvailable || kernelTransitionRef.current) return;
+    runSequenceRef.current += 1;
+    runAllActiveRef.current = false;
+    setRunningAll(false);
+    kernelTransitionRef.current = true;
+    setSwitchingKernel(true);
     try {
       await restartKernel(targetPath || undefined);
+      if (nextPythonPath) setActivePythonPath(nextPythonPath);
       setVariables([]);
       onNotify(nextPythonPath ? `Switched kernel to ${nextPythonPath.split('/').slice(-3).join('/')}` : 'Python kernel restarted');
     } catch (err) {
       onNotify(`Kernel restart failed: ${(err as Error).message}`);
+    } finally {
+      kernelTransitionRef.current = false;
+      if (mountedRef.current) setSwitchingKernel(false);
+    }
+  };
+
+  const handleInterruptKernel = async () => {
+    runSequenceRef.current += 1;
+    runAllActiveRef.current = false;
+    setRunningAll(false);
+    try {
+      await interruptKernel();
+    } catch (err) {
+      onNotify(`Could not interrupt kernel: ${(err as Error).message}`);
     }
   };
 
@@ -912,7 +968,8 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
         viewMode={viewMode}
         readingTheme={readingTheme}
         kernelAvailable={kernelAvailable}
-        isRunning={runningCellId !== null}
+        isRunning={runningCellId !== null || runningAll}
+        kernelTransitioning={switchingKernel}
         reactiveMode={reactiveMode}
         envs={envs}
         activePythonPath={activePythonPath}
@@ -923,7 +980,7 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
         onSelectPythonPath={(p) => void handleRestartKernel(p)}
         onRunActive={() => void runCellById(activeCellId, true)}
         onRunAll={() => void runAllCells()}
-        onInterrupt={() => void interruptKernel()}
+        onInterrupt={() => void handleInterruptKernel()}
         onRestart={() => void handleRestartKernel()}
         onClearAllOutputs={() =>
           updateCells((cells) =>
@@ -1173,7 +1230,7 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
                                 e.stopPropagation();
                                 void runCellById(cell.id, false);
                               }}
-                              disabled={runningCellId !== null}
+                              disabled={runningCellId !== null || runningAll || switchingKernel}
                               title={isSqlCell ? 'Run SQL Query (Shift+Enter)' : 'Run Cell (Shift+Enter)'}
                               className={`w-6 h-6 rounded-md flex items-center justify-center transition disabled:opacity-40 ${
                                 isSqlCell
@@ -1286,7 +1343,7 @@ export const NotebookApp: React.FC<NotebookAppProps> = ({
                           <>
                             <button
                               title="Step-Through Execution Trace — scrub line-by-line variable & shape changes"
-                              disabled={runningCellId !== null}
+                              disabled={runningCellId !== null || runningAll || switchingKernel}
                               onClick={(e) => {
                                 e.stopPropagation();
                                 void traceCellById(cell.id);

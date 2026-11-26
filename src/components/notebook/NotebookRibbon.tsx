@@ -27,6 +27,7 @@ interface NotebookRibbonProps {
   readingTheme: ReadingTheme;
   kernelAvailable: boolean;
   isRunning: boolean;
+  kernelTransitioning?: boolean;
   reactiveMode: boolean;
   envs: PythonEnvInfo[];
   activePythonPath: string;
@@ -55,6 +56,7 @@ export const NotebookRibbon: React.FC<NotebookRibbonProps> = ({
   readingTheme,
   kernelAvailable,
   isRunning,
+  kernelTransitioning = false,
   reactiveMode,
   envs,
   activePythonPath,
@@ -119,7 +121,7 @@ export const NotebookRibbon: React.FC<NotebookRibbonProps> = ({
       {/* Kernel Run Cluster */}
       <button
         onClick={onRunActive}
-        disabled={isRunning}
+        disabled={isRunning || kernelTransitioning}
         title="Run Selected Cell (Shift+Enter)"
         className="px-2.5 py-1 rounded-md text-xs font-semibold bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-45 flex items-center gap-1 transition shadow-xs"
       >
@@ -128,7 +130,7 @@ export const NotebookRibbon: React.FC<NotebookRibbonProps> = ({
       </button>
       <button
         onClick={onRunAll}
-        disabled={isRunning}
+        disabled={isRunning || kernelTransitioning}
         title="Run All Code Cells"
         className={`${btn()} disabled:opacity-45`}
       >
@@ -145,7 +147,7 @@ export const NotebookRibbon: React.FC<NotebookRibbonProps> = ({
           <span>Stop</span>
         </button>
       )}
-      <button onClick={onRestart} title="Restart Python Kernel" className={btn()}>
+      <button onClick={onRestart} disabled={kernelTransitioning} title="Restart Python Kernel" className={btn()}>
         <RotateCcw className="w-3.5 h-3.5" />
       </button>
       <button onClick={onClearAllOutputs} title="Clear All Outputs" className={btn()}>
@@ -187,14 +189,16 @@ export const NotebookRibbon: React.FC<NotebookRibbonProps> = ({
       <div className="flex items-center gap-1.5">
         <span
           className={`w-2 h-2 rounded-full ${
-            isRunning
+            isRunning || kernelTransitioning
               ? 'bg-amber-500 animate-pulse'
               : kernelAvailable
                 ? 'bg-emerald-500'
                 : 'bg-slate-400'
           }`}
           title={
-            isRunning
+            kernelTransitioning
+              ? 'Switching Python kernel'
+              : isRunning
               ? 'Kernel Busy'
               : kernelAvailable
                 ? 'Native Python Kernel Ready'
@@ -205,6 +209,7 @@ export const NotebookRibbon: React.FC<NotebookRibbonProps> = ({
           <select
             aria-label="Python Environment"
             value={activePythonPath}
+            disabled={kernelTransitioning}
             onChange={(e) => onSelectPythonPath(e.target.value)}
             className="h-7 max-w-[170px] px-1.5 text-[11px] font-mono bg-slate-50 border border-slate-200 rounded text-slate-700 focus:outline-none focus:border-violet-500"
           >

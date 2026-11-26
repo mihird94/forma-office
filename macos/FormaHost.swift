@@ -494,6 +494,10 @@ final class PythonKernelManager: @unchecked Sendable {
     private var readBuffer = Data()
     private var scanOffset = 0
     private var currentReqId: String?
+    private var pendingStartReqId: String?
+    private var executionStarted = false
+    private var pendingInterrupt = false
+    private var interruptRequested = false
     private var activePythonPath: String = ""
     private var cachedEnvs: [[String: String]]?
 
@@ -535,18 +539,27 @@ final class PythonKernelManager: @unchecked Sendable {
             case "restart":
                 self.stopLocked()
                 let target = !pythonPath.isEmpty ? pythonPath : self.resolveDefaultPython()
-                if !target.isEmpty {
-                    self.activePythonPath = target
-                    _ = self.ensureRunningLocked(pythonPath: target)
+                if let error = self.ensureRunningLocked(pythonPath: target) {
+                    self.emitObject(["reqId": reqId, "ok": false, "error": error])
+                } else {
+                    self.pendingStartReqId = reqId
+                    self.ioQueue.asyncAfter(deadline: .now() + 8) { [weak self] in
+                        guard let self, self.pendingStartReqId == reqId else { return }
+                        self.pendingStartReqId = nil
+                        self.emitObject(["reqId": reqId, "ok": false, "error": "Python kernel did not become ready"])
+                        self.stopLocked()
+                    }
                 }
-                self.emitObject([
-                    "reqId": reqId,
-                    "ok": true,
-                    "activePath": self.activePythonPath,
-                ])
             case "interrupt":
-                if let proc = self.process, proc.isRunning {
-                    Darwin.kill(proc.processIdentifier, SIGINT)
+                if self.currentReqId != nil, !self.interruptRequested, let proc = self.process, proc.isRunning {
+                    self.interruptRequested = true
+                    if !self.executionStarted {
+                        self.pendingInterrupt = true
+                    } else if Darwin.kill(proc.processIdentifier, SIGINT) != 0 {
+                        self.interruptRequested = false
+                        self.emitObject(["reqId": reqId, "ok": false, "error": "Could not interrupt the Python kernel"])
+                        return
+                    }
                 }
                 self.emitObject(["reqId": reqId, "ok": true])
             default:
@@ -562,6 +575,17 @@ final class PythonKernelManager: @unchecked Sendable {
     }
 
     private func stopLocked() {
+        if let pendingStart = pendingStartReqId {
+            pendingStartReqId = nil
+            emitObject(["reqId": pendingStart, "ok": false, "error": "Python kernel was restarted"])
+        }
+        if let pendingReq = currentReqId {
+            currentReqId = nil
+            emitObject(["reqId": pendingReq, "ok": false, "error": "Python kernel was restarted",
+                        "execution_count": 0, "elapsed_ms": 0, "variables": [],
+                        "outputs": [["output_type": "error", "ename": "KernelRestarted",
+                                     "evalue": "Python kernel was restarted", "traceback": ["Python kernel was restarted"]]]])
+        }
         stdoutHandle?.readabilityHandler = nil
         stderrHandle?.readabilityHandler = nil
         try? stdinHandle?.close()
@@ -576,6 +600,9 @@ final class PythonKernelManager: @unchecked Sendable {
         readBuffer.removeAll(keepingCapacity: false)
         scanOffset = 0
         currentReqId = nil
+        executionStarted = false
+        pendingInterrupt = false
+        interruptRequested = false
     }
 
     private func handleProcessExitLocked() {
@@ -583,8 +610,15 @@ final class PythonKernelManager: @unchecked Sendable {
         stdinHandle = nil
         stdoutHandle = nil
         stderrHandle = nil
+        if let pendingStart = pendingStartReqId {
+            pendingStartReqId = nil
+            emitObject(["reqId": pendingStart, "ok": false, "error": "Python kernel exited before becoming ready"])
+        }
         if let pendingReq = currentReqId {
             currentReqId = nil
+            executionStarted = false
+            pendingInterrupt = false
+            interruptRequested = false
             emitObject([
                 "reqId": pendingReq,
                 "ok": false,
@@ -730,24 +764,27 @@ final class PythonKernelManager: @unchecked Sendable {
         proc.standardOutput = outPipe
         proc.standardError = errPipe
 
-        outPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+        outPipe.fileHandleForReading.readabilityHandler = { [weak self, weak proc] handle in
             let chunk = handle.availableData
-            guard let self else { return }
+            guard let self, let proc else { return }
             if chunk.isEmpty {
                 handle.readabilityHandler = nil
                 self.ioQueue.async {
+                    guard self.process === proc else { return }
                     self.handleProcessExitLocked()
                 }
                 return
             }
             self.ioQueue.async {
+                guard self.process === proc else { return }
                 self.consumeStdoutLocked(chunk)
             }
         }
 
-        proc.terminationHandler = { [weak self] _ in
+        proc.terminationHandler = { [weak self] terminated in
             guard let self else { return }
             self.ioQueue.async {
+                guard self.process === terminated else { return }
                 self.handleProcessExitLocked()
             }
         }
@@ -787,6 +824,23 @@ final class PythonKernelManager: @unchecked Sendable {
             if let line = String(data: lineData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
                !line.isEmpty {
+                if let data = line.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   (obj["type"] as? String) == "ready", let pendingStart = pendingStartReqId {
+                    pendingStartReqId = nil
+                    emitObject(["reqId": pendingStart, "ok": true, "activePath": activePythonPath])
+                }
+                if let data = line.data(using: .utf8),
+                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   (obj["type"] as? String) == "execution_started",
+                   let msgReqId = obj["reqId"] as? String, msgReqId == currentReqId {
+                    executionStarted = true
+                    if pendingInterrupt, let proc = process, proc.isRunning {
+                        pendingInterrupt = false
+                        Darwin.kill(proc.processIdentifier, SIGINT)
+                    }
+                    continue
+                }
                 if let pendingReq = currentReqId,
                    let data = line.data(using: .utf8),
                    let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -794,6 +848,9 @@ final class PythonKernelManager: @unchecked Sendable {
                    msgReqId == pendingReq,
                    (obj["type"] as? String) != "stream_chunk" {
                     currentReqId = nil
+                    executionStarted = false
+                    pendingInterrupt = false
+                    interruptRequested = false
                 }
                 onJsonEvent(line)
             }
@@ -801,6 +858,10 @@ final class PythonKernelManager: @unchecked Sendable {
     }
 
     private func execCode(reqId: String, code: String, requestedPython: String, cwd: String, mode: String = "exec") {
+        if currentReqId != nil {
+            emitObject(["reqId": reqId, "ok": false, "error": "Python kernel is busy"])
+            return
+        }
         if let err = ensureRunningLocked(pythonPath: requestedPython) {
             emitObject([
                 "reqId": reqId,
@@ -823,6 +884,7 @@ final class PythonKernelManager: @unchecked Sendable {
             "type": mode,
             "reqId": reqId,
             "code": code,
+            "notifyStarted": true,
         ]
         if !cwd.isEmpty {
             payload["cwd"] = cwd
@@ -834,9 +896,13 @@ final class PythonKernelManager: @unchecked Sendable {
         }
         line.append("\n")
         currentReqId = reqId
+        executionStarted = false
+        pendingInterrupt = false
+        interruptRequested = false
         do {
             try stdinHandle?.write(contentsOf: Data(line.utf8))
         } catch {
+            currentReqId = nil
             stopLocked()
             emitObject([
                 "reqId": reqId,

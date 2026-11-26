@@ -196,9 +196,11 @@ npm run dev
 
 ```bash
 npx tsc -b                          # Strict TypeScript check
-npm test -- --run                   # Vitest unit & format round-trip suite (16 suites / 76 tests)
+npm test -- --run                   # Vitest unit & format round-trip suite (20 suites / 96 tests)
 node scripts/verify-indexer.mjs     # E2E indexer, OCR/vision retrieval, and 10-tool MCP verification
 node scripts/verify-index-watcher.mjs # E2E FSEvents watcher & LaunchAgent resilience tests
+node scripts/verify-lab-kernel.mjs  # Native Swift Python kernel lifecycle & interrupt tests
+node scripts/benchmark-forma-mcp.mjs # Live persistent MCP worker latency & cache reuse check
 ```
 
 ---

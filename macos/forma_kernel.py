@@ -116,9 +116,7 @@ class _StreamCapture(io.TextIOBase):
 
     def flush(self):
         if self._req_id and self._pending:
-            now = time.monotonic()
-            if now - self._last_flush >= 0.06:
-                self._emit_pending(now)
+            self._emit_pending()
 
 
 def _flush_matplotlib_figures(outputs):
@@ -1142,16 +1140,25 @@ def main():
                         sys.path.insert(0, cwd)
                 except Exception:
                     pass
-            if mtype == "trace":
-                max_steps = int(msg.get("max_steps", 300) or 300)
-                res = _trace_code(msg.get("code", ""), max_steps=max(10, min(800, max_steps)))
-                _send({"type": "trace_result", "reqId": req_id, **res})
-            elif mtype == "sql":
-                res = _execute_sql(msg.get("code", ""), req_id=req_id)
-                _send({"type": "result", "reqId": req_id, **res})
-            else:
-                res = _execute_code(msg.get("code", ""), req_id=req_id)
-                _send({"type": "result", "reqId": req_id, **res})
+            try:
+                if msg.get("notifyStarted"):
+                    _send({"type": "execution_started", "reqId": req_id})
+                if mtype == "trace":
+                    max_steps = int(msg.get("max_steps", 300) or 300)
+                    res = _trace_code(msg.get("code", ""), max_steps=max(10, min(800, max_steps)))
+                    _send({"type": "trace_result", "reqId": req_id, **res})
+                elif mtype == "sql":
+                    res = _execute_sql(msg.get("code", ""), req_id=req_id)
+                    _send({"type": "result", "reqId": req_id, **res})
+                else:
+                    res = _execute_code(msg.get("code", ""), req_id=req_id)
+                    _send({"type": "result", "reqId": req_id, **res})
+            except KeyboardInterrupt:
+                _send({"type": "result", "reqId": req_id, "ok": False,
+                       "execution_count": EXEC_COUNT, "elapsed_ms": 0, "variables": [],
+                       "outputs": [{"output_type": "error", "ename": "KeyboardInterrupt",
+                                    "evalue": "Execution interrupted by user",
+                                    "traceback": ["KeyboardInterrupt: Execution interrupted by user"]}]})
         elif mtype == "reset":
             _close_all_matplotlib_figures()
             NAMESPACE = {"__name__": "__main__", "__doc__": None}

@@ -72,7 +72,7 @@ describe('Forma Lab (.ipynb nbformat v4.5, KaTeX, Python Kernel)', () => {
     ].join('\n') + '\n';
 
     const out = execFileSync('python3', [kernelPath], { input: cmds, encoding: 'utf8' });
-    const lines = out.trim().split('\n').map((l) => JSON.parse(l));
+    const lines = out.trim().split('\n').map((l) => JSON.parse(l)).filter((event) => event.type !== 'stream_chunk');
 
     expect(lines[0].type).toBe('ready');
     // r1: stdout captured + variable x inspected
