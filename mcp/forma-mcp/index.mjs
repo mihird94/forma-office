@@ -6,17 +6,16 @@ import { promisify } from 'node:util';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import {
-  createCanvasFile,
-  createDocFile,
-  createSheetFile,
-  createSlidesFile,
-} from './creators.mjs';
+import { IndexerWorker } from './indexerWorker.mjs';
+
+let creatorsPromise;
+const loadCreators = () => (creatorsPromise ??= import('./creators.mjs'));
 
 const execute = promisify(execFile);
 const binary = process.env.FORMA_INDEXER_BIN || join(
   homedir(), 'Library', 'Application Support', 'FormaOffice', 'bin', 'forma-indexer'
 );
+const worker = process.env.FORMA_MCP_PERSISTENT === '0' ? null : new IndexerWorker(binary);
 const kinds = z.enum(['document', 'spreadsheet', 'slides', 'pdf', 'notebook', 'canvas', 'image']);
 const safeString = (max) => z.string().min(1).max(max).refine(
   value => value.trim().length > 0 && !value.includes('\0'), 'Enter a non-empty string'
@@ -50,6 +49,8 @@ function parseIndexerOutput(stdout) {
 
 async function indexer(args, signal) {
   try {
+    const payload = await worker?.request(args, signal);
+    if (payload) return result(payload);
     const { stdout } = await execute(binary, [...args, '--json'], { signal, maxBuffer: 8 * 1024 * 1024 });
     return parseIndexerOutput(stdout);
   } catch (error) {
@@ -159,6 +160,19 @@ async function finalizeCreatedFile(canonicalPath, meta, shouldOpen, signal) {
 }
 
 const server = new McpServer({ name: 'forma-mcp', version: '1.0.0' });
+const closeWorker = () => worker?.close();
+process.stdin.once('end', closeWorker);
+process.stdin.once('close', closeWorker);
+for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, () => {
+  closeWorker();
+  const child = worker?.child;
+  if (!child) process.exit(0);
+  else {
+    child.once('exit', () => process.exit(0));
+    setTimeout(() => process.exit(0), 3500).unref();
+  }
+});
+server.server.onclose = closeWorker;
 
 server.registerTool('forma_search', {
   description: 'Search the shared Forma index for matching document sections.',
@@ -242,6 +256,7 @@ server.registerTool('forma_create_canvas', {
   const approved = await scopedCreatePath(path, ['fcanvas', 'excalidraw'], signal);
   if (typeof approved !== 'string') return approved;
   try {
+    const { createCanvasFile } = await loadCreators();
     const meta = await createCanvasFile({ path: approved, title, mermaid, template });
     return finalizeCreatedFile(approved, meta, Boolean(open), signal);
   } catch (error) {
@@ -265,6 +280,7 @@ server.registerTool('forma_create_sheet', {
   const approved = await scopedCreatePath(path, ['xlsx', 'csv'], signal);
   if (typeof approved !== 'string') return approved;
   try {
+    const { createSheetFile } = await loadCreators();
     const meta = await createSheetFile({ path: approved, title, sheets });
     return finalizeCreatedFile(approved, meta, Boolean(open), signal);
   } catch (error) {
@@ -291,6 +307,7 @@ server.registerTool('forma_create_slides', {
   const approved = await scopedCreatePath(path, ['pptx'], signal);
   if (typeof approved !== 'string') return approved;
   try {
+    const { createSlidesFile } = await loadCreators();
     const meta = await createSlidesFile({ path: approved, title, theme, slides });
     return finalizeCreatedFile(approved, meta, Boolean(open), signal);
   } catch (error) {
@@ -311,6 +328,7 @@ server.registerTool('forma_create_doc', {
   const approved = await scopedCreatePath(path, ['docx', 'md'], signal);
   if (typeof approved !== 'string') return approved;
   try {
+    const { createDocFile } = await loadCreators();
     const meta = await createDocFile({ path: approved, title, markdown });
     return finalizeCreatedFile(approved, meta, Boolean(open), signal);
   } catch (error) {

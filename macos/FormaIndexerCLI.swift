@@ -13,6 +13,7 @@ struct FormaIndexerCLI {
     private static let usage = """
         forma-indexer sync [--force] [--json]
         forma-indexer watch [--json]
+        forma-indexer serve
         forma-indexer request-sync [--json]
         forma-indexer index <path> [--force] [--json]
         forma-indexer search <query> [--kind <kind>] [--limit <n>] [--json]
@@ -30,7 +31,9 @@ struct FormaIndexerCLI {
         }
         do {
             let watching = arguments.first == "watch"
+            let serving = arguments.first == "serve"
             let requestSync = arguments.first == "request-sync"
+            if serving && arguments.count != 1 { throw CLIError.usage("serve takes no arguments") }
             if watching || requestSync {
                 guard arguments.dropFirst().allSatisfy({ $0 == "--json" }) else {
                     throw CLIError.usage("\(arguments[0]) only accepts --json")
@@ -42,14 +45,14 @@ struct FormaIndexerCLI {
                 write(["ok": true, "queued": true], json: json)
                 return
             }
-            let body = watching ? [:] : try requestBody(arguments)
+            let body = (watching || serving) ? [:] : try requestBody(arguments)
             let backend = FormaSemanticBackend(allowOllamaFallback: false)
             let signalHandlers = [SIGINT, SIGTERM].map { code in
                 Darwin.signal(code, SIG_IGN)
                 let handler = DispatchSource.makeSignalSource(signal: code, queue: .global(qos: .utility))
                 handler.setEventHandler {
                     backend.shutdown()
-                    Darwin.exit(watching ? 0 : 128 + code)
+                    Darwin.exit((watching || serving) ? 0 : 128 + code)
                 }
                 handler.resume()
                 return handler
@@ -58,6 +61,10 @@ struct FormaIndexerCLI {
                 let watcher = FormaIndexWatch(backend: backend, store: store) { write($0, json: json) }
                 // Keep the signal subscriptions alive for the lifetime of the watch process.
                 try withExtendedLifetime(signalHandlers) { try watcher.run() }
+            }
+            if serving {
+                withExtendedLifetime(signalHandlers) { serve(backend) }
+                return
             }
             let result = invoke(backend, body)
             backend.shutdown()
@@ -69,6 +76,39 @@ struct FormaIndexerCLI {
             if !json { fputs("\(usage)\n", stderr) }
             Darwin.exit(2)
         }
+    }
+
+    private static func serve(_ backend: FormaSemanticBackend) {
+        let outputLock = NSLock()
+        let active = DispatchGroup()
+        @Sendable func send(_ payload: [String: Any]) {
+            outputLock.lock()
+            defer { outputLock.unlock() }
+            write(payload, json: true)
+        }
+        send(["mode": "serve", "ok": true, "protocol": 1])
+        while let line = readLine() {
+            if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { continue }
+            guard let data = line.data(using: .utf8),
+                  let request = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                  let id = request["id"] as? String, !id.isEmpty,
+                  let args = request["args"] as? [String] else {
+                send(["id": NSNull(), "payload": ["ok": false, "error": "Invalid worker request"]])
+                continue
+            }
+            do {
+                let body = try requestBody(args)
+                active.enter()
+                backend.handleAIRequest(body) { payload in
+                    send(["id": id, "payload": payload])
+                    active.leave()
+                }
+            } catch {
+                send(["id": id, "payload": ["ok": false, "error": error.localizedDescription]])
+            }
+        }
+        _ = active.wait(timeout: .now() + 5)
+        backend.shutdown()
     }
 
     private static func invoke(_ backend: FormaSemanticBackend, _ body: [String: Any]) -> [String: Any] {

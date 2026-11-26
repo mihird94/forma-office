@@ -264,3 +264,77 @@ describe('Forma MCP tool schemas and CLI dispatch', () => {
     expect(symlinkRes.structuredContent).toMatchObject({ ok: false, error: expect.stringContaining('symbolic link') });
   });
 });
+
+describe('Forma MCP persistent worker', () => {
+  let scratch: string;
+  let client: Client;
+  let log: string;
+  beforeAll(async () => {
+    scratch = await mkdtemp(join(tmpdir(), 'forma-worker-test-'));
+    log = join(scratch, 'workers.log');
+    const binary = join(scratch, 'forma-indexer');
+    await writeFile(binary, `#!/usr/bin/env node
+const fs = require('node:fs');
+const readline = require('node:readline');
+fs.appendFileSync(process.env.WORKER_LOG, 'start '+process.pid+'\\n');
+console.log(JSON.stringify({ok:true,mode:'serve',protocol:1}));
+const lines = readline.createInterface({ input: process.stdin });
+lines.on('line', line => {
+  const {id,args} = JSON.parse(line);
+  if (args.includes('crash')) process.exit(1);
+  const delay = args.includes('slow') ? 100 : 1;
+  setTimeout(() => console.log(JSON.stringify({id,payload:{ok:true,args}})), delay);
+});
+lines.on('close', () => { fs.appendFileSync(process.env.WORKER_LOG, 'end '+process.pid+'\\n'); });
+`);
+    await chmod(binary, 0o755);
+    client = new Client({ name: 'worker-tests', version: '1' });
+    await client.connect(new StdioClientTransport({ command: process.execPath, args: ['mcp/forma-mcp/index.mjs'], env: { FORMA_INDEXER_BIN: binary, WORKER_LOG: log } }));
+  });
+  afterAll(async () => {
+    await client?.close();
+    if (scratch) await rm(scratch, { recursive: true, force: true });
+  });
+  it('reuses one worker and matches out-of-order concurrent replies', async () => {
+    const [slow, fast, status, read] = await Promise.all([
+      client.callTool({ name: 'forma_search', arguments: { query: 'slow' } }),
+      client.callTool({ name: 'forma_search', arguments: { query: 'fast' } }),
+      client.callTool({ name: 'forma_status', arguments: {} }),
+      client.callTool({ name: 'forma_read', arguments: { target: 'document-id' } }),
+    ]);
+    expect(slow.structuredContent).toMatchObject({ ok: true, args: ['search', '--', 'slow', '--json'] });
+    expect(fast.structuredContent).toMatchObject({ ok: true, args: ['search', '--', 'fast', '--json'] });
+    expect(status.structuredContent).toMatchObject({ ok: true, args: ['status', '--json'] });
+    expect(read.structuredContent).toMatchObject({ ok: true, args: ['read', '--', 'document-id', '--json'] });
+    expect((await readFile(log, 'utf8')).match(/^start /gm)).toHaveLength(1);
+  });
+  it('cancels a request without stopping a sibling', async () => {
+    const controller = new AbortController();
+    const cancelled = client.callTool({ name: 'forma_search', arguments: { query: 'slow' } }, undefined, { signal: controller.signal });
+    const sibling = client.callTool({ name: 'forma_search', arguments: { query: 'fast' } });
+    controller.abort();
+    await expect(cancelled).rejects.toThrow();
+    expect((await sibling).structuredContent).toMatchObject({ ok: true, args: ['search', '--', 'fast', '--json'] });
+    expect((await readFile(log, 'utf8')).match(/^start /gm)).toHaveLength(1);
+  });
+  it('respawns after a crash and closes cleanly', async () => {
+    const failed = await client.callTool({ name: 'forma_search', arguments: { query: 'crash' } });
+    expect(failed.isError).toBe(true);
+    const recovered = await client.callTool({ name: 'forma_status', arguments: {} });
+    expect(recovered.structuredContent).toMatchObject({ ok: true });
+    expect((await readFile(log, 'utf8')).match(/^start /gm)).toHaveLength(2);
+    await client.close();
+    for (let i = 0; i < 30; i++) {
+      if ((await readFile(log, 'utf8')).includes('end ')) break;
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    const lines = await readFile(log, 'utf8');
+    const latestPid = [...lines.matchAll(/^start (\d+)$/gm)].at(-1)![1];
+    expect(lines).toContain(`end ${latestPid}`);
+    for (let i = 0; i < 30; i++) {
+      try { process.kill(Number(latestPid), 0); } catch { break; }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    expect(() => process.kill(Number(latestPid), 0)).toThrow();
+  });
+});

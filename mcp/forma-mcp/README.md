@@ -2,6 +2,10 @@
 
 Forma MCP connects a local assistant to the same index used by the Forma Start Hub and ⌘K search. The stdio server delegates each index operation to `forma-indexer`. Native Swift Markdown extraction, Apple Vision OCR, **EmbeddingGemma 2**, and **`jina-reranker-v1-turbo-en`** cross-encoder reranking all run locally on the Mac.
 
+The MCP server starts a persistent `forma-indexer serve` worker on its first request. Searches reuse the worker's model processes and vector cache until idle shutdown or disconnect; folder access is checked on each request. Older binaries and test stubs fall back to one-shot CLI calls. Set `FORMA_MCP_PERSISTENT=0` to use one-shot calls explicitly. Creator libraries load only when a create tool is used.
+
+The matrix cache retains at most 256 MiB by estimated size; a matrix larger than that is searched but not cached. Search and read requests have a two-minute deadline, status and folder requests 30 seconds, and index/sync requests 30 minutes. A deadline resets the worker and reports an error to other in-flight requests; an explicit cancellation only removes that request's waiter.
+
 ```mermaid
 flowchart LR
   Client["MCP Client (Claude Code, Cursor, Gemini CLI)"]
@@ -89,6 +93,8 @@ npx tsc -b
 npm test -- --run
 node scripts/verify-indexer.mjs
 node scripts/verify-index-watcher.mjs
+node scripts/benchmark-forma-mcp.mjs
 ```
 
 The verification scripts use temporary fixtures and the embedded runtime with Ollama disabled. They cover Office, PDF, notebook and Canvas indexing, MCP over stdio, fair backfill order, and file and folder changes while the watcher is running or offline.
+The benchmark reads the live index, uses isolated model sockets, checks cache reuse and concurrent cold misses, and verifies that its worker and model processes exit on disconnect. Its default quality check expects the Gamma Distribution Explorer file; set `FORMA_BENCH_QUERY` and `FORMA_BENCH_EXPECT` to a query and expected title or path for a different index.

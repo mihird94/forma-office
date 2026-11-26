@@ -120,6 +120,14 @@ try {
   await until(() => messages.some(result => result.mode === 'changes' && result.indexedCount === 1 && result.totalScanned === 1),
     'a single file change in the indexer summary');
 
+  // The FSEvents watcher must index agent-authored HTML regardless of the
+  // system's preferred application for opening web pages or HTML files.
+  const htmlPath = await fixture(rootA, 'agent-created.html', '<!doctype html><title>Agent HTML</title><h1>Agent document</h1><p>freshhtmlcanary</p>');
+  await until(() => indexed().some(row => row.path.endsWith('/First Folder/agent-created.html')) && hasText('freshhtmlcanary'), 'new agent-created HTML file');
+  await writeFile(htmlPath, '<!doctype html><title>Agent HTML</title><h1>Agent document</h1><p>revisedhtmlcanary</p>');
+  await until(() => hasText('revisedhtmlcanary') && !hasText('freshhtmlcanary'), 'updated agent-created HTML file');
+  console.log('Agent-created HTML indexed and updated without opening the file in Forma');
+
   const oldTree = join(rootA, 'Incoming');
   const newTree = join(rootA, 'Renamed');
   await mkdir(oldTree);

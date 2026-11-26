@@ -22,6 +22,7 @@ INDEX_SOURCES=(
   "$ROOT_DIR/macos/FormaIndexConfig.swift"
   "$ROOT_DIR/macos/FormaDocExtractors.swift"
   "$ROOT_DIR/macos/FormaHTMLExtractor.swift"
+  "$ROOT_DIR/macos/FormaVectorCacheBudget.swift"
 )
 INDEX_LIBS=("$BUILD_DIR/FormaSocketHTTP.o" -framework Vision -framework PDFKit -framework CryptoKit -framework UniformTypeIdentifiers -framework Accelerate -lsqlite3 -lcurl)
 swiftc "${SWIFT_FLAGS[@]}" "$ROOT_DIR/macos/FormaHost.swift" "${INDEX_SOURCES[@]}" \

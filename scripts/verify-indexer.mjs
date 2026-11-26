@@ -242,8 +242,10 @@ try {
   assert.deepEqual(llamaProcessesOn(port), [], 'A search left a child process running');
 
   const transport = new StdioClientTransport({
-    command: process.execPath, args: ['mcp/forma-mcp/index.mjs'], env, stderr: 'pipe',
+    command: process.execPath, args: ['mcp/forma-mcp/index.mjs'], env: { ...env, FORMA_INDEX_CACHE_TRACE: '1' }, stderr: 'pipe',
   });
+  let cacheTrace = '';
+  transport.stderr?.on('data', chunk => { cacheTrace += chunk; });
   transport.stderr?.pipe(process.stderr);
   client = new Client({ name: 'forma-acceptance', version: '1.0.0' });
   await client.connect(transport);
@@ -266,7 +268,13 @@ try {
     return result.structuredContent;
   };
   assert.equal((await call('forma_status', {})).indexedDocs, 14);
-  assert.equal((await call('forma_search', { query: canaries.docx, limit: 1 })).hits[0].title, 'summary.docx');
+  for (const phase of ['cold', 'warm']) {
+    const started = performance.now();
+    const search = await call('forma_search', { query: canaries.docx, limit: 1 });
+    assert.equal(search.hits[0]?.title, 'summary.docx');
+    assert.equal(search.hits[0]?.matchType, 'reranked');
+    console.log(JSON.stringify({ check: `MCP ${phase} search`, elapsedMs: Math.round(performance.now() - started) }));
+  }
   assert.ok((await call('forma_read', { target: join(root, 'summary.docx') })).text.includes(canaries.docx));
   const xlsxRead = await call('forma_read', { target: join(root, 'ledger.xlsx') });
   assert.ok(xlsxRead.text.includes('| ') && xlsxRead.text.includes('| --- |'), xlsxRead.text);
@@ -277,17 +285,32 @@ try {
   });
   assert.equal(createdCanvas.indexed, true);
   assert.equal((await call('forma_search', { query: 'Helios Gateway', kind: 'canvas', limit: 1 })).hits[0].title, 'MCP Acceptance Flow');
-  assert.deepEqual(llamaProcessesOn(port), [], 'An MCP search left a child process running');
-  console.log(JSON.stringify({ check: 'MCP initialize, list, status, search, read, create', toolCount: listed.length }));
-
+  await new Promise(resolve => setTimeout(resolve, 50));
+  const buildsBeforeExternalEdit = (cacheTrace.match(/forma-vector-cache build/g) ?? []).length;
   const revised = join(root, 'memo.txt');
   assert.equal(sql("SELECT count(*) FROM chunk_search WHERE chunk_search MATCH 'appendix';"), '1');
   await writeFile(revised, 'Replacement synapse tracking memorandum.');
   await run(['index', revised]);
   assert.equal(sql("SELECT count(*) FROM chunk_search WHERE chunk_search MATCH 'appendix';"), '0');
   assert.equal(sql("SELECT count(*) FROM chunk_search WHERE chunk_search MATCH 'synapse';"), '1');
+  assert.equal((await call('forma_search', { query: 'Replacement synapse tracking memorandum', limit: 1 })).hits[0].title, 'memo.txt');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.ok((cacheTrace.match(/forma-vector-cache build/g) ?? []).length > buildsBeforeExternalEdit, 'External write should invalidate the cached vector matrix');
   assert.equal(sql('SELECT count(*) FROM chunk_search;'), sql('SELECT count(*) FROM chunks;'));
-  console.log(JSON.stringify({ check: 'full-text search index follows edits and deletions' }));
+  console.log(JSON.stringify({ check: 'persistent search follows external edits' }));
+  const workerPids = execFileSync('/usr/bin/pgrep', ['-P', String(transport.pid)], { encoding: 'utf8' })
+    .trim().split('\n').filter(Boolean);
+  assert.equal(workerPids.length, 1, 'Expected one persistent indexer worker');
+  await client.close();
+  client = undefined;
+  const alive = pid => { try { process.kill(Number(pid), 0); return true; } catch { return false; } };
+  for (let i = 0; i < 50 && (workerPids.some(alive) || llamaProcessesOn(port).length); i++) {
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  assert.ok(workerPids.every(pid => !alive(pid)), 'MCP left its indexer worker running');
+  assert.deepEqual(llamaProcessesOn(port), [], 'MCP left a model server running');
+  console.log(JSON.stringify({ check: 'MCP initialize, list, status, search, read, create', toolCount: listed.length }));
+
 } finally {
   await client?.close();
   if (process.env.FORMA_KEEP_INDEXER_FIXTURES) console.log('Fixture workspace: ' + scratch);

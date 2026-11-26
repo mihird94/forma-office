@@ -87,11 +87,17 @@ final class FormaSemanticBackend: @unchecked Sendable {
     private var db: OpaquePointer?
     private let localWriteLock = NSLock()
     private var localWriteGeneration: Int64 = 0
-    private let vectorCacheLock = NSLock()
+    private let vectorCacheLock = NSCondition()
+    private let versionReaderLock = NSLock()
+    private var versionReader: OpaquePointer?
     private var vectorMatrixCache: [String: CachedVectorMatrix] = [:]
+    private var vectorCacheBudget = FormaVectorCacheBudget()
+    private var vectorCacheLoading = Set<String>()
 
     private let rerankSocket: URL
-    private let runtimeLock = NSLock()
+    private let stoppingLock = NSLock()
+    private let embedRuntimeLock = NSLock()
+    private let rerankRuntimeLock = NSLock()
     private var runtimeStopping = false
     private var embeddedProcess: Process?
     private var embeddedLastUse: Date?
@@ -171,10 +177,11 @@ final class FormaSemanticBackend: @unchecked Sendable {
         shutdownEmbeddedSync()
         shutdownRerankSync()
         if let handle = db { sqlite3_close(handle) }
+        if let handle = versionReader { sqlite3_close(handle) }
     }
 
     func shutdown() {
-        runtimeLock.withLock { runtimeStopping = true }
+        stoppingLock.withLock { runtimeStopping = true }
         shutdownEmbeddedSync()
         shutdownRerankSync()
     }
@@ -800,18 +807,17 @@ final class FormaSemanticBackend: @unchecked Sendable {
     }
 
     private func shutdownEmbeddedSync(onlyIfIdle: Bool = false) {
-        guard runtimeLock.withLock({ embeddedProcess != nil }) else { return }
         _ = try? withFormaFileLock(runtimeLockURL) {
-            runtimeLock.lock()
-            defer { runtimeLock.unlock() }
-            if onlyIfIdle, let lastUse = embeddedLastUse, Date().timeIntervalSince(lastUse) < 29 { return }
-            embeddedIdleTimer?.cancel()
-            embeddedIdleTimer = nil
-            if let process = embeddedProcess, process.isRunning {
-                process.terminate()
-                process.waitUntilExit()
+            let process = embedRuntimeLock.withLock { () -> Process? in
+                if onlyIfIdle, let lastUse = embeddedLastUse, Date().timeIntervalSince(lastUse) < 29 { return nil }
+                embeddedIdleTimer?.cancel()
+                embeddedIdleTimer = nil
+                let process = embeddedProcess
+                embeddedProcess = nil
+                return process
             }
-            embeddedProcess = nil
+            guard let process else { return }
+            if process.isRunning { process.terminate(); process.waitUntilExit() }
             if isOwnedEmbeddingSocket() { _ = unlink(embeddedSocket.path) }
         }
     }
@@ -829,11 +835,9 @@ final class FormaSemanticBackend: @unchecked Sendable {
         }
 
         // Clean up any dead process handle
-        if let old = embeddedProcess, !old.isRunning {
-            embeddedProcess = nil
-        }
+        embedRuntimeLock.withLock { if let old = embeddedProcess, !old.isRunning { embeddedProcess = nil } }
 
-        if embeddedProcess == nil {
+        if embedRuntimeLock.withLock({ embeddedProcess == nil }) {
             if isOwnedEmbeddingSocket(), unlink(embeddedSocket.path) != 0 { return (false, false, nil) }
             let proc = Process()
             proc.executableURL = paths.binURL
@@ -860,7 +864,7 @@ final class FormaSemanticBackend: @unchecked Sendable {
 
             do {
                 try proc.run()
-                embeddedProcess = proc
+                embedRuntimeLock.withLock { embeddedProcess = proc }
             } catch {
                 return (false, false, nil)
             }
@@ -868,10 +872,11 @@ final class FormaSemanticBackend: @unchecked Sendable {
 
         // 3. Wait for /props to report ready (usually ~1.5s once Metal shaders are cached, up to 25s first run)
         for _ in 0..<85 {
-            if let proc = embeddedProcess, !proc.isRunning {
-                embeddedProcess = nil
-                return (false, false, nil)
-            }
+            if stoppingLock.withLock({ runtimeStopping }) { return (false, false, nil) }
+            if embedRuntimeLock.withLock({ () -> Bool in
+                if let proc = embeddedProcess, !proc.isRunning { embeddedProcess = nil; return true }
+                return false
+            }) { return (false, false, nil) }
             let probe = probeEmbeddedPropsSync(timeout: 0.5)
             if probe.ready {
                 return probe
@@ -883,13 +888,13 @@ final class FormaSemanticBackend: @unchecked Sendable {
 
     private func embedViaEmbeddedSync(_ makeItems: (EmbeddedState) -> [Any]?) -> [[Float]]? {
         for attempt in 0..<3 {
-            guard !runtimeLock.withLock({ runtimeStopping }) else { return nil }
+            guard !stoppingLock.withLock({ runtimeStopping }) else { return nil }
             // Keep a serving instance alive for the duration of its request. Other readers can
             // embed concurrently. Only starting or stopping a server needs an exclusive lease.
             let shared = try? withFormaFileLock(runtimeLockURL, operation: LOCK_SH) { () -> (ready: Bool, vectors: [[Float]]?) in
                 let state = probeEmbeddedPropsSync(timeout: 0.6)
                 guard state.ready else { return (false, nil) }
-                defer { runtimeLock.withLock { resetEmbeddedIdleTimer() } }
+                defer { embedRuntimeLock.withLock { resetEmbeddedIdleTimer() } }
                 guard let items = makeItems(state) else { return (true, nil) }
                 return (true, postEmbeddedItems(items))
             }
@@ -897,11 +902,9 @@ final class FormaSemanticBackend: @unchecked Sendable {
             if shared.ready { return shared.vectors }
             if attempt == 2 { break }
             let started = try? withFormaFileLock(runtimeLockURL) {
-                runtimeLock.withLock {
-                    guard !runtimeStopping, ensureEmbeddedRunningSync().ready else { return false }
-                    resetEmbeddedIdleTimer()
-                    return true
-                }
+                guard !stoppingLock.withLock({ runtimeStopping }), ensureEmbeddedRunningSync().ready else { return false }
+                embedRuntimeLock.withLock { resetEmbeddedIdleTimer() }
+                return true
             }
             guard started == true else { return nil }
         }
@@ -994,18 +997,17 @@ final class FormaSemanticBackend: @unchecked Sendable {
     }
 
     private func shutdownRerankSync(onlyIfIdle: Bool = false) {
-        guard runtimeLock.withLock({ rerankProcess != nil }) else { return }
         _ = try? withFormaFileLock(rerankLockURL) {
-            runtimeLock.lock()
-            defer { runtimeLock.unlock() }
-            if onlyIfIdle, let lastUse = rerankLastUse, Date().timeIntervalSince(lastUse) < 29 { return }
-            rerankIdleTimer?.cancel()
-            rerankIdleTimer = nil
-            if let process = rerankProcess, process.isRunning {
-                process.terminate()
-                process.waitUntilExit()
+            let process = rerankRuntimeLock.withLock { () -> Process? in
+                if onlyIfIdle, let lastUse = rerankLastUse, Date().timeIntervalSince(lastUse) < 29 { return nil }
+                rerankIdleTimer?.cancel()
+                rerankIdleTimer = nil
+                let process = rerankProcess
+                rerankProcess = nil
+                return process
             }
-            rerankProcess = nil
+            guard let process else { return }
+            if process.isRunning { process.terminate(); process.waitUntilExit() }
             if isOwnedRerankSocket() { _ = unlink(rerankSocket.path) }
         }
     }
@@ -1017,10 +1019,8 @@ final class FormaSemanticBackend: @unchecked Sendable {
         guard let paths = resolveRerankPaths() else {
             return false
         }
-        if let old = rerankProcess, !old.isRunning {
-            rerankProcess = nil
-        }
-        if rerankProcess == nil {
+        rerankRuntimeLock.withLock { if let old = rerankProcess, !old.isRunning { rerankProcess = nil } }
+        if rerankRuntimeLock.withLock({ rerankProcess == nil }) {
             if isOwnedRerankSocket(), unlink(rerankSocket.path) != 0 { return false }
             let proc = Process()
             proc.executableURL = paths.binURL
@@ -1041,16 +1041,17 @@ final class FormaSemanticBackend: @unchecked Sendable {
             proc.standardError = FileHandle.nullDevice
             do {
                 try proc.run()
-                rerankProcess = proc
+                rerankRuntimeLock.withLock { rerankProcess = proc }
             } catch {
                 return false
             }
         }
         for _ in 0..<45 {
-            if let proc = rerankProcess, !proc.isRunning {
-                rerankProcess = nil
+            if stoppingLock.withLock({ runtimeStopping }) { return false }
+            if rerankRuntimeLock.withLock({ () -> Bool in
+                if let proc = rerankProcess, !proc.isRunning { rerankProcess = nil; return true }
                 return false
-            }
+            }) { return false }
             if rerankSocketResponse("/health", timeout: 0.4) != nil {
                 return true
             }
@@ -1076,10 +1077,10 @@ final class FormaSemanticBackend: @unchecked Sendable {
     private func rerankViaEmbeddedSync(query: String, documents: [String]) -> [Int: Double]? {
         guard !documents.isEmpty else { return [:] }
         for attempt in 0..<3 {
-            guard !runtimeLock.withLock({ runtimeStopping }) else { return nil }
+            guard !stoppingLock.withLock({ runtimeStopping }) else { return nil }
             let shared = try? withFormaFileLock(rerankLockURL, operation: LOCK_SH) { () -> (ready: Bool, scores: [Int: Double]?) in
                 guard rerankSocketResponse("/health", timeout: 0.5) != nil else { return (false, nil) }
-                defer { runtimeLock.withLock { resetRerankIdleTimer() } }
+                defer { rerankRuntimeLock.withLock { resetRerankIdleTimer() } }
                 let payload: [String: Any] = [
                     "query": query,
                     "documents": documents,
@@ -1106,11 +1107,9 @@ final class FormaSemanticBackend: @unchecked Sendable {
             if shared.ready { return shared.scores }
             if attempt == 2 { break }
             let started = try? withFormaFileLock(rerankLockURL) {
-                runtimeLock.withLock {
-                    guard !runtimeStopping, ensureRerankRunningSync() else { return false }
-                    resetRerankIdleTimer()
-                    return true
-                }
+                guard !stoppingLock.withLock({ runtimeStopping }), ensureRerankRunningSync() else { return false }
+                rerankRuntimeLock.withLock { resetRerankIdleTimer() }
+                return true
             }
             guard started == true else { return nil }
         }
@@ -1764,30 +1763,20 @@ final class FormaSemanticBackend: @unchecked Sendable {
 
     private func readDocumentSync(target: String, maxChars: Int, ocr: Bool) -> [String: Any] {
         guard !target.isEmpty else { return ["ok": false, "error": "Missing file path or document ID"] }
-        var path = ""
+        var path = target.hasPrefix("/") ? target : ""
+        var docId = target.hasPrefix("/") ? "" : target
         var title = ""
         var kind = ""
-        var storedChunks: [[String: String]] = []
-        if let reader = openReadDatabase() {
-            let query = """
-                SELECT d.path, d.title, d.kind, c.section_label, c.text
-                FROM docs d LEFT JOIN chunks c ON c.doc_id = d.doc_id
-                WHERE d.doc_id = ? ORDER BY c.chunk_idx;
-                """
-            var count = 0
-            _ = select(reader, query, bind: { sqlite3_bind_text($0, 1, target, -1, SQLITE_TRANSIENT) }) { stmt in
-                path = columnText(stmt, 0)
-                title = columnText(stmt, 1)
-                kind = columnText(stmt, 2)
-                let text = String(columnText(stmt, 4).prefix(max(0, maxChars - count)))
-                if !text.isEmpty {
-                    storedChunks.append(["sectionLabel": columnText(stmt, 3), "text": text])
-                    count += text.count + 2
-                }
+        var failure: String?
+
+        if path.isEmpty, let reader = openReadDatabase() {
+            _ = select(reader, "SELECT path, title, kind FROM docs WHERE doc_id = ? LIMIT 1;", bind: {
+                sqlite3_bind_text($0, 1, target, -1, SQLITE_TRANSIENT)
+            }) { stmt in
+                path = columnText(stmt, 0); title = columnText(stmt, 1); kind = columnText(stmt, 2)
             }
             sqlite3_close(reader)
         }
-        if target.hasPrefix("/") { path = target }
         if !path.isEmpty {
             do {
                 let config = try configStore.loadIndexConfig()
@@ -1798,16 +1787,31 @@ final class FormaSemanticBackend: @unchecked Sendable {
                     ["sectionLabel": $0.sectionLabel, "text": $0.text]
                 }
                 return ["ok": true, "title": doc.title, "path": url.path, "kind": doc.kind, "text": text, "sections": sections]
-            } catch where title.isEmpty {
-                return ["ok": false, "error": error.localizedDescription]
-            } catch { /* Use the saved workspace content if the original file is unavailable. */ }
+            } catch { failure = error.localizedDescription }
         }
-        guard !title.isEmpty || !kind.isEmpty else { return ["ok": false, "error": "Document not found"] }
-        let text = String(storedChunks.compactMap { $0["text"] }.joined(separator: "\n\n").prefix(maxChars))
-        return [
-            "ok": true, "docId": target, "path": path, "title": title, "kind": kind,
-            "text": text, "sections": storedChunks,
-        ]
+        guard let reader = openReadDatabase() else { return ["ok": false, "error": failure ?? "Document not found"] }
+        defer { sqlite3_close(reader) }
+        if docId.isEmpty {
+            _ = select(reader, "SELECT doc_id, title, kind FROM docs WHERE path = ? LIMIT 1;", bind: {
+                sqlite3_bind_text($0, 1, path, -1, SQLITE_TRANSIENT)
+            }) { stmt in
+                docId = columnText(stmt, 0); title = columnText(stmt, 1); kind = columnText(stmt, 2)
+            }
+        }
+        guard !docId.isEmpty, !title.isEmpty || !kind.isEmpty else { return ["ok": false, "error": failure ?? "Document not found"] }
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        var sections: [[String: String]] = []
+        var count = 0
+        if sqlite3_prepare_v2(reader, "SELECT section_label, text FROM chunks WHERE doc_id = ? ORDER BY chunk_idx;", -1, &statement, nil) == SQLITE_OK, let statement {
+            sqlite3_bind_text(statement, 1, docId, -1, SQLITE_TRANSIENT)
+            while count < maxChars && sqlite3_step(statement) == SQLITE_ROW {
+                let text = String(columnText(statement, 1).prefix(max(0, maxChars - count)))
+                if !text.isEmpty { sections.append(["sectionLabel": columnText(statement, 0), "text": text]); count += text.count + 2 }
+            }
+        }
+        let text = String(sections.compactMap { $0["text"] }.joined(separator: "\n\n").prefix(maxChars))
+        return ["ok": true, "docId": docId, "path": path, "title": title, "kind": kind, "text": text, "sections": sections]
     }
 
     // MARK: - Hybrid Search
@@ -2029,10 +2033,6 @@ final class FormaSemanticBackend: @unchecked Sendable {
             docIds: docIds,
             matrix: matrix
         )
-        vectorCacheLock.withLock {
-            if vectorMatrixCache.count >= 2 { vectorMatrixCache.removeAll(keepingCapacity: true) }
-            vectorMatrixCache["\(model)\n\(kind ?? "")"] = entry
-        }
         return entry
     }
 
@@ -2043,18 +2043,40 @@ final class FormaSemanticBackend: @unchecked Sendable {
         let dims = query.count
         guard dims > 0 else { return }
 
-        var dataVersion: Int64 = 0
-        _ = select(reader, "PRAGMA data_version;") { dataVersion = sqlite3_column_int64($0, 0) }
+        let dataVersion: Int64 = versionReaderLock.withLock {
+            if versionReader == nil { versionReader = openReadDatabase() }
+            var version: Int64 = 0
+            if let handle = versionReader { _ = select(handle, "PRAGMA data_version;") { version = sqlite3_column_int64($0, 0) } }
+            return version
+        }
         let localGen = localWriteLock.withLock { localWriteGeneration }
         let versionKey = "\(dataVersion):\(localGen)"
-        let cacheKey = "\(model)\n\(kind ?? "")"
+        let cacheKey = "\(model)\n\(kind ?? "")\n\(dims)\n\(versionKey)"
 
-        let cached = vectorCacheLock.withLock { vectorMatrixCache[cacheKey] }
+        vectorCacheLock.lock()
+        while vectorCacheLoading.contains(cacheKey) { vectorCacheLock.wait() }
         let entry: CachedVectorMatrix
-        if let cached, cached.versionKey == versionKey && cached.dims == dims {
+        if let cached = vectorMatrixCache[cacheKey] {
+            if ProcessInfo.processInfo.environment["FORMA_INDEX_CACHE_TRACE"] == "1" { fputs("forma-vector-cache hit\n", stderr) }
+            vectorCacheBudget.touch(cacheKey)
             entry = cached
+            vectorCacheLock.unlock()
         } else {
+            if ProcessInfo.processInfo.environment["FORMA_INDEX_CACHE_TRACE"] == "1" { fputs("forma-vector-cache build\n", stderr) }
+            vectorCacheLoading.insert(cacheKey)
+            vectorCacheLock.unlock()
             entry = loadVectorMatrix(reader, model: model, kind: kind, dims: dims, versionKey: versionKey)
+            vectorCacheLock.lock()
+            // Include the matrix and a conservative estimate for the row IDs and strings.
+            let bytes = entry.matrix.count * MemoryLayout<Float>.stride
+                + entry.chunkIds.count * MemoryLayout<Int64>.stride
+                + entry.docIds.reduce(0) { $0 + 32 + $1.utf8.count }
+            let admission = vectorCacheBudget.admit(cacheKey, bytes: bytes)
+            for key in admission.evicted { vectorMatrixCache.removeValue(forKey: key) }
+            if admission.stored { vectorMatrixCache[cacheKey] = entry }
+            vectorCacheLoading.remove(cacheKey)
+            vectorCacheLock.broadcast()
+            vectorCacheLock.unlock()
         }
 
         let rowCount = entry.rowCount
