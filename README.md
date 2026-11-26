@@ -50,28 +50,32 @@ Forma keeps your documents strictly on your Mac in standard open formats (`.xlsx
 ```mermaid
 flowchart LR
   Apps["7 Native arm64 Apps (Swift / WKWebView + FastZip)"]
+  Preview["Isolated HTML Sandbox (forma-preview:// + Spatial Pin Review)"]
   Search["Forma Search Launcher (⌃Space)"]
-  Files["Watched Open Formats (.xlsx, .docx, .pptx, .pdf, .ipynb, .fcanvas)"]
+  Files["Watched Open Formats (.xlsx, .docx, .pptx, .pdf, .ipynb, .fcanvas, .html)"]
   Indexer["forma-indexer Daemon (FSEvents + Daily 02:00 Reconcile)"]
-  Extract["Native Swift Markdownifier + Vision OCR (FormaDocExtractors)"]
-  Store["Hybrid Local Index (SQLite FTS5 + int8/f32 Vectors + vDSP_mmul Cache)"]
+  Extract["Swift Markdownifier + Vision OCR + HTML Parser"]
+  Store["Hybrid Local Index (SQLite FTS5 + int8/f32 Vectors + 256 MiB LRU vDSP_mmul)"]
   Embed["On-Demand llama-server (EmbeddingGemma 2, Unix Socket)"]
   Rerank["On-Demand llama-server (jina-reranker-v1-turbo-en, Unix Socket)"]
+  Worker["Persistent forma-indexer serve Worker (NDJSON)"]
   MCP["10-Tool Stdio MCP Server (Claude Code, Cursor, Gemini CLI)"]
 
   Apps -->|"Read & write open files"| Files
+  Apps <-->|"Isolated graphics & pins"| Preview
   Files -->|"FSEvents delta"| Indexer
-  Indexer -->|"Structured Markdown & OCR"| Extract
+  Indexer -->|"Structured Markdown, HTML & OCR"| Extract
   Extract -->|"768-dim text & image vectors"| Embed
   Extract -->|"FTS5 tokens + q8/f32 vectors"| Store
   Embed -->|"Embeddings"| Store
   Search -->|"Hybrid rank"| Store
   Search -.->|"Query embedding"| Embed
   Search -.->|"Top-candidate rerank"| Rerank
-  MCP -->|"Search, read & create files"| Files
-  MCP -->|"Semantic retrieval"| Store
-  MCP -.->|"Query embedding"| Embed
-  MCP -.->|"Cross-encoder rerank"| Rerank
+  MCP <-->|"Multiplexed NDJSON"| Worker
+  Worker -->|"Semantic retrieval"| Store
+  Worker -.->|"Query embedding"| Embed
+  Worker -.->|"Cross-encoder rerank"| Rerank
+  MCP -->|"Create & open files"| Files
 ```
 
 ---
@@ -81,7 +85,7 @@ flowchart LR
 | App | Bundle ID | Formats | Highlights |
 | :--- | :--- | :--- | :--- |
 | **Forma Sheets** | `com.formaoffice.sheets` | `.xlsx`, `.ods`, `.csv`, `.tsv` | Virtualized grid, incremental DAG formula engine (`XLOOKUP`, `SUMIFS`/`COUNTIFS`, dynamic `FILTER`/`UNIQUE`/`SORT` spill, pivot tables), `fflate`/`FastZip` codecs, charts round-tripped in `.xlsx`, live table transfer to Docs/Slides, `⌘F` find |
-| **Forma Docs** | `com.formaoffice.docs` | `.docx`, `.odt`, `.md`, `.html`, Print/PDF | TipTap/ProseMirror rich editor, live in-place Obsidian-style KaTeX/LaTeX (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`, `Σ` insert menu), Paperwhite/Sepia/Night themes, `[[wikilinks]]`, live linked Sheets tables & Canvas diagrams with 1-click refresh, Mermaid diagrams, `fflate`/`FastZip` ODT/DOCX codecs, outline & review comments |
+| **Forma Docs** | `com.formaoffice.docs` | `.docx`, `.odt`, `.md`, `.html`, Print/PDF | TipTap/ProseMirror rich editor, **Live HTML Review Mode** (`forma-preview://` isolated WebKit sandbox for SVG/Canvas/WebGL/JS demos, spatial pin + quoted comments, "Copy for Agent", CDN opt-in, 1-click "Convert to Editable Doc"), live in-place Obsidian-style KaTeX/LaTeX (`$...$`, `$$...$$`, `\(...\)`, `\[...\]`, `Σ` insert menu), Paperwhite/Sepia/Night themes, `[[wikilinks]]`, live linked Sheets tables & Canvas diagrams with 1-click refresh, Mermaid diagrams, `fflate`/`FastZip` ODT/DOCX codecs, outline & review comments |
 | **Forma Slides** | `com.formaoffice.slides` | `.pptx`, `.odp`, 16:9 vector `.pdf` | 16:9 drag/resize/nudge stage, native editable tables, `fflate`/`FastZip` PPTX/ODP codecs, 6 themes & 5 layouts, live linked Canvas diagrams with 1-click refresh, speaker notes, full-screen presenter mode (`⌥⌘P`) |
 | **Forma PDF** | `com.formaoffice.pdf` | ISO 32000 `.pdf` | Zero-copy HTTP 206 Range streaming for large books, continuous scroll, Reading Mode (`⌘\`) with Paperwhite/Sepia/Night themes, AcroForm fill, redactions, highlight/text/ink/note baking, page reorder/rotate/merge/extract, document diff compare |
 | **Forma Lab** | `com.formaoffice.lab` | `.ipynb` (nbformat 4.5), `.py`, `.md` | Persistent zero-dependency local Python 3 kernel (`macos/forma_kernel.py`), auto conda/venv/Homebrew discovery, Open Folder (`⇧⌘O`), interactive DataFrames, SQL queries, matplotlib PNG capture, KaTeX math, reactive `# @slider` controls, AST cell DAG, `sys.settrace` step scrubber |
@@ -121,7 +125,7 @@ flowchart LR
   - `com.formaoffice.indexer-reconcile`: Scheduled daily catch-up reconcile at **02:00** local time.
 - **Native Swift Pre-Index Markdownifier (`FormaDocExtractors.swift`):** Emits structured Markdown headings (`#`–`######`), bullet lists, and pipe tables for `.docx`/`.odt`; Markdown pipe tables for `.xlsx`/`.ods`; Markdown for `.html`/`.htm`; and automatically runs Apple Vision OCR (up to 8 pages) on sparse or scanned `.pdf` files (`< 25` non-whitespace chars/page), alongside PDF page JPEG renders (up to 8 pages via PDFKit), inline Doc/Slide images, Canvas images, and Lab matplotlib PNGs.
 - **HTML indexing:** A static, tolerant HTML parser extracts the page title, text structure, image references and alt text, SVG descriptions, and saved review comments. Embedded data-URL images can enter the visual index. It does not execute JavaScript, fetch linked images, or interpret dynamically rendered charts. HTML extraction reads up to the first 512 KiB of the file.
-- **Hybrid Ranking, Quantized Vector Cache & Cross-Encoder Reranking:** SQLite schema v3 stores both exact `float32` vectors and `int8` quantized (`embedding_q8`) vectors; an in-memory contiguous `[Float]` matrix cache (invalidated via `PRAGMA data_version` + local write generation) scores all chunks in a single Accelerate `vDSP_mmul` pass, rescores top-160 candidates with exact `float32` `vDSP_dotpr`, fuses with FTS5 BM25, and applies `jina-reranker-v1-turbo-en` (`0.65 * sigmoid(logit) + 0.35 * hybridScore`, keeping `[Visual · ...]` chunks out of text-only reranking).
+- **Hybrid Ranking, Quantized Vector Cache & Cross-Encoder Reranking:** SQLite schema v3 stores both exact `float32` vectors and `int8` quantized (`embedding_q8`) vectors; a budgeted in-memory LRU `[Float]` matrix cache (256 MiB cap in `FormaVectorCacheBudget.swift`, single-flight miss coalescing, invalidated via `PRAGMA data_version` + local write generation) scores all chunks in a single Accelerate `vDSP_mmul` pass, rescores top-160 candidates with exact `float32` `vDSP_dotpr`, fuses with FTS5 BM25, and applies `jina-reranker-v1-turbo-en` (`0.65 * sigmoid(logit) + 0.35 * hybridScore`, keeping `[Visual · ...]` chunks out of text-only reranking).
 - **Hub Management:** Manage watched roots (default: `~/Documents`, `~/Desktop`, `~/Downloads`) and trigger syncs from **Indexed Folders** in the Forma Start Hub or `⌘K`.
 
 ---
@@ -152,7 +156,7 @@ See [mcp/forma-mcp/README.md](mcp/forma-mcp/README.md) for JSON client configs, 
 - **100% Local:** Zero cloud calls, zero telemetry, and zero outbound requests after optional model download.
 - **Hardened IPC:** Embedded `llama-server` instances bind strictly to private owner-only Unix-domain sockets (`/private/tmp/forma-embed-<uid>/<slot>.sock` and `/private/tmp/forma-rerank-<uid>/<slot>.sock`, kept short for macOS `sun_path` limits).
 - **Publisher SHA-256 Verification:** `npm run setup:embed` fetches over strict HTTPS (`--proto '=https' --proto-redir '=https'`) and verifies exact SHA-256 checksums on all three GGUF artifacts (`embeddinggemma-2-Q8_0.gguf`, `mmproj-embeddinggemma-2-Q8_0.gguf`, and `jina-reranker-v1-turbo-en-Q8_0.gguf`) before installing.
-- **Watched-Folder & HTML Boundaries:** Both `FormaFileGrants` (native host) and `mcp/forma-mcp` enforce canonical `realpath` watched-folder scoping and reject hidden paths/symlinks; document HTML is sanitized with `DOMPurify` under a strict CSP.
+- **Watched-Folder & HTML Boundaries:** Both `FormaFileGrants` (native host) and `mcp/forma-mcp` enforce canonical `realpath` watched-folder scoping and reject hidden paths/symlinks; TipTap document HTML is sanitized with `DOMPurify` under a strict CSP, and interactive `.html` review previews run inside a separate `forma-preview://` origin (`sandbox="allow-scripts"`, no `allow-same-origin`, independent HTTP CSP, blocked from `webkit.messageHandlers`).
 
 ---
 
@@ -207,8 +211,8 @@ node scripts/benchmark-forma-mcp.mjs # Live persistent MCP worker latency & cach
 
 ## Project Layout
 
-- `src/` — React 18, TypeScript, Vite 6 frontend, document/sheet/slide/PDF/notebook/canvas codecs (`fflate`-powered `src/utils/fastZip.ts`), TipTap extensions (`liveLatex.ts`), and IndexedDB storage (`src/storage/`)
-- `macos/` — Native arm64 Cocoa/`WKWebView` app host (`FormaHost.swift`), Carbon/AppKit Spotlight launcher (`FormaSpotlight.swift`), FSEvents background indexer (`FormaIndexerCLI.swift`, `FormaIndexWatch.swift`), pre-index Swift Markdownifier & Vision OCR (`FormaDocExtractors.swift`), multimodal index & Unix-socket bridge (`FormaSemanticIndex.swift`, `FormaSocketHTTP.c`), Python kernel (`forma_kernel.py`), and app icon generator (`GenerateIcons.swift`)
-- `mcp/forma-mcp/` — 10-tool stdio MCP server and declarative `.fcanvas`/`.xlsx`/`.pptx`/`.docx` creators
+- `src/` — React 18, TypeScript, Vite 6 frontend, document/sheet/slide/PDF/notebook/canvas codecs (`fflate`-powered `src/utils/fastZip.ts`), `HtmlReviewWorkspace.tsx`, TipTap extensions (`liveLatex.ts`), and IndexedDB storage (`src/storage/`)
+- `macos/` — Native arm64 Cocoa/`WKWebView` app host & `forma-preview://` handler (`FormaHost.swift`), Carbon/AppKit Spotlight launcher (`FormaSpotlight.swift`), persistent/CLI background indexer (`FormaIndexerCLI.swift`, `FormaIndexWatch.swift`), pre-index Swift Markdownifier, Vision OCR & static HTML parser (`FormaDocExtractors.swift`, `FormaHTMLExtractor.swift`), multimodal index, vector LRU cache budget & Unix-socket bridge (`FormaSemanticIndex.swift`, `FormaVectorCacheBudget.swift`, `FormaSocketHTTP.c`), Python kernel (`forma_kernel.py`), and app icon generator (`GenerateIcons.swift`)
+- `mcp/forma-mcp/` — 10-tool stdio MCP server (`index.mjs`), persistent NDJSON worker client (`indexerWorker.mjs`), and declarative `.fcanvas`/`.xlsx`/`.pptx`/`.docx` creators
 - `scripts/` — macOS app builder/installer (`build-macos-apps.sh`), model stager (`setup-embedded-models.sh`), LaunchAgent installers, and E2E verification harnesses
 - `docs/assets/` — Native macOS app icons and interface screenshots referenced in this README

@@ -9,22 +9,22 @@ The matrix cache retains at most 256 MiB by estimated size; a matrix larger than
 ```mermaid
 flowchart LR
   Client["MCP Client (Claude Code, Cursor, Gemini CLI)"]
-  Server["mcp/forma-mcp/index.mjs (stdio)"]
-  CLI["forma-indexer CLI"]
-  Extract["Swift Markdownifier + Vision OCR"]
-  Index["SQLite FTS5 + int8/f32 Vectors (vDSP_mmul)"]
+  Server["mcp/forma-mcp/index.mjs + indexerWorker.mjs (stdio)"]
+  Worker["forma-indexer serve (Persistent NDJSON Worker)"]
+  Extract["Swift Markdownifier + Vision OCR + HTML Parser"]
+  Index["SQLite FTS5 + int8/f32 Vectors (256 MiB LRU vDSP_mmul)"]
   Embed["EmbeddingGemma 2 (Unix Socket)"]
   Rerank["jina-reranker-v1-turbo-en (Unix Socket)"]
   Files["Watched Folders (realpath-scoped)"]
 
   Client <-->|"JSON-RPC stdio"| Server
-  Server -->|"search, read, status, index"| CLI
-  Server -->|"create & open files"| Files
-  CLI --> Extract
+  Server <-->|"Multiplexed NDJSON"| Worker
+  Server -->|"create & open files (lazy creators)"| Files
+  Worker --> Extract
   Extract --> Index
-  CLI --> Index
-  CLI -.->|"Embeddings"| Embed
-  CLI -.->|"Cross-encoder rerank"| Rerank
+  Worker --> Index
+  Worker -.->|"Embeddings"| Embed
+  Worker -.->|"Cross-encoder rerank"| Rerank
 ```
 
 Run these commands from the Forma repository.
